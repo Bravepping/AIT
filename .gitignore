@@ -1,0 +1,10 @@
+/build/
+/dist/
+node_modules/
+/apps/vision-studio/dist/
+/apps/vision-studio/src-tauri/target/
+/apps/vision-studio/src-tauri/gen/
+/HardwareCheck-*/
+/HardwareCheck-*.zip
+/11.png
+__pycache__/

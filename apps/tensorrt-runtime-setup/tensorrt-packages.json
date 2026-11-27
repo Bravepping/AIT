@@ -1,0 +1,26 @@
+[
+  {
+    "filename": "tensorrt_cu12_bindings-10.16.1.11-cp313-none-win_amd64.whl",
+    "size": 964908,
+    "sha256": "9794032093940924429957c89ebf27f893a7823b3daf48fd9427bfa23a9a52de",
+    "url": "https://files.pythonhosted.org/packages/44/8a/a4763ff95242b97dcd750c6d4a0a61e08431849304c4aa2b30c09fb5c0cb/tensorrt_cu12_bindings-10.16.1.11-cp313-none-win_amd64.whl"
+  },
+  {
+    "filename": "tensorrt_cu12_libs-10.16.1.11-py3-none-win_amd64.whl",
+    "size": 2206065494,
+    "sha256": "ed0d4536f1322aa2f76da54feb3f9bd2d14d89e4325cef02165a98f3a2c1a493",
+    "url": "https://pypi.nvidia.com/tensorrt-cu12-libs/tensorrt_cu12_libs-10.16.1.11-py3-none-win_amd64.whl"
+  },
+  {
+    "filename": "tensorrt_rtx_cu12_bindings-1.7.1.116-cp313-none-win_amd64.whl",
+    "size": 877710,
+    "sha256": "d8d012a6f6e0e7196eb9a719170b9a94c8773c686e1261f1ae1d62c71e6f28d6",
+    "url": "https://files.pythonhosted.org/packages/37/74/7e54e28a34fc93ebb13947d0d6e2b7cc6c94602ec0c5465f866825656aa0/tensorrt_rtx_cu12_bindings-1.7.1.116-cp313-none-win_amd64.whl"
+  },
+  {
+    "filename": "tensorrt_rtx_cu12_libs-1.7.1.116-py3-none-win_amd64.whl",
+    "size": 87871590,
+    "sha256": "28defeb3aca647646308d00f9fe32e91da37920fb1b121f1c5adbd774cd52358",
+    "url": "https://pypi.nvidia.com/tensorrt-rtx-cu12-libs/tensorrt_rtx_cu12_libs-1.7.1.116-py3-none-win_amd64.whl"
+  }
+]

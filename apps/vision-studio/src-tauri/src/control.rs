@@ -284,7 +284,7 @@ impl Frame {
                 class_priority: class_rule.map_or(0, |rule| rule.priority) })
         }).collect();
         let geometry: Vec<_> = observations.iter().map(|item| item.observation).collect();
-        let tracks = lock.tracker.update(&geometry, self.sequence, self.frame_at, profile.lost_wait_ms);
+        let tracks = lock.tracker.update(&geometry, self.sequence, self.frame_at);
         let selected = observations.into_iter().zip(tracks.iter().copied()).filter_map(|(observation, track)| {
             let radius = if let Some((incumbent, _, _)) = lock.incumbent {
                 if track.id != incumbent { return None; }
@@ -490,6 +490,10 @@ impl<D: KmBoxDriver> AutomationController<D> {
     pub fn disarm(&mut self, reason: &'static str) -> Value {
         self.auto_preview_pending = false;
         self.stop(AutomationState::Stopped, reason)
+    }
+
+    pub fn stop_manual(&mut self, emergency: bool) -> Value {
+        self.disarm(if emergency { "F8 紧急停止，请重新武装" } else { "已停止跟随，请按需重新启用" })
     }
 
     fn stop(&mut self, state: AutomationState, reason: &'static str) -> Value {

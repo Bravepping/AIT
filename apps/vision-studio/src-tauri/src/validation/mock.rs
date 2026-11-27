@@ -300,7 +300,7 @@ fn stale_326ms_frame_clears_real_queue_and_cannot_rearm() {
 
 #[test]
 fn real_tracking_faults_clear_candidates_and_require_new_arm() {
-    for fault in ["target", "network", "frame", "input", "model", "ack", "stop"] {
+    for fault in ["target", "network", "frame", "input", "model", "ack", "stop", "f8", "release_left", "release_right"] {
         let mut gate = setup_real();
         gate.buttons(&physical_input(3, 2));
         send_frame(&mut gate, 2, &FIRST);
@@ -313,13 +313,19 @@ fn real_tracking_faults_clear_candidates_and_require_new_arm() {
             "input" => gate.buttons(&input(3, 1201)).unwrap(),
             "model" => gate.worker(&json!({"kind":"model","model":1,"error":"fault"})).unwrap(),
             "ack" => gate.live_fault("KMBox 命令应答超时").unwrap(),
-            "stop" => gate.disarm("手动停止"),
+            "stop" => gate.stop_manual(false),
+            "f8" => gate.stop_manual(true),
+            "release_left" => gate.buttons(&physical_input(2, 3)).unwrap(),
+            "release_right" => gate.buttons(&physical_input(1, 3)).unwrap(),
             _ => unreachable!(),
         };
         assert!(update["candidate"].is_null() && update["armed"] == false, "{fault}");
+        assert!(update["last_stop"]["cleared_pending"] == true, "{fault}");
+        if fault == "f8" { assert_eq!(update["last_stop"]["reason"], "F8 紧急停止，请重新武装"); }
         assert!(!gate.movement.driver.live, "{fault}");
         gate.buttons(&physical_input(3, 4));
-        assert!(gate.target_sample().is_none(), "{fault}");
+        gate.tick();
+        assert!(gate.target_sample().is_none() && gate.movement.driver.sent.is_empty(), "{fault}");
     }
 }
 

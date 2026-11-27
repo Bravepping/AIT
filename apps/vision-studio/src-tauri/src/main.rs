@@ -481,7 +481,7 @@ fn arm_real_tracking(app: AppHandle, state: State<DryRunState>, profile_id: u32,
 
 #[tauri::command]
 fn stop_gate(state: State<DryRunState>, emergency: Option<bool>) {
-    state.update(|gate| gate.disarm(if emergency == Some(true) { "F8 紧急停止，请重新武装" } else { "已停止跟随，请按需重新启用" }));
+    state.update(|gate| gate.stop_manual(emergency.unwrap_or(false)));
 }
 
 #[tauri::command]

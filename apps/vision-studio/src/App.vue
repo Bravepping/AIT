@@ -733,7 +733,7 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
 
 <template>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.7 Final 候选</small></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.7 Final 候选更新</small></div>
     <div class="top-actions">
       <div class="process-state"><span class="dot" :class="workerState"></span>
         {{ ready ? '设备 B · 推理进程就绪' : workerState === 'starting' ? '启动推理进程' : '推理进程不可用' }}

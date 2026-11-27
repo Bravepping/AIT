@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -61,6 +62,11 @@ namespace VisionHardwareCheck
         DateTime linkAt;
         int reportCount, longestGap;
         int heartbeatAcksSinceReport;
+        int heartbeatAcks;
+        StreamWriter wireTrace;
+        string wireTracePath;
+        int wireTraceRecords;
+        long wireTraceDeadline;
         int ignoredReports, stationaryReports, stationaryMaxGap, stationaryDuration;
         long stationarySince = -1;
         bool combo, comboReady;
@@ -89,7 +95,8 @@ namespace VisionHardwareCheck
         internal sealed class Snapshot
         {
             internal bool Connected, Monitoring, Halted, Busy, Combo;
-            internal int Buttons = -1, Count, Reports, LongestGap;
+            internal int Buttons = -1, Count, Reports, LongestGap, HeartbeatAcks;
+            internal bool TraceActive;
             internal long Age = -1;
             internal int IgnoredReports, StationaryReports, StationaryMaxGap, StationaryDuration;
             internal DateTime LastReportAt, LinkAt;
@@ -196,6 +203,59 @@ namespace VisionHardwareCheck
                 monitorCleanupPort = 0;
                 log("物理监控已关闭");
             }, false);
+        }
+
+        internal bool StartWireTrace()
+        {
+            if (!Current.Monitoring) return false;
+            return Enqueue(delegate
+            {
+                if (monitor == null) { log("KMBox 报文记录未开始 · 监控已关闭"); return; }
+                if (wireTrace != null) return;
+                try
+                {
+                    string folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "local.ndi.vision-control", "logs");
+                    Directory.CreateDirectory(folder);
+                    wireTracePath = Path.Combine(folder, "kmbox-wire-" + Guid.NewGuid().ToString("N") + ".txt");
+                    wireTrace = new StreamWriter(wireTracePath, false, new System.Text.UTF8Encoding(false), 65536);
+                    wireTraceRecords = 0;
+                    wireTraceDeadline = clock.ElapsedMilliseconds + 30000;
+                    Trace(PreciseUtcNow(), "begin threshold_ms=" + ReportTimeoutMs + " previous_report=" + reportCount);
+                    if (wireTrace != null) log("KMBox 报文记录已开始（最多 30 秒或 50000 条）");
+                }
+                catch (Exception ex) { log("KMBox 报文记录无法启动 · " + ex.Message); }
+            }, false);
+        }
+
+        void Trace(DateTime at, string fields)
+        {
+            if (wireTrace == null) return;
+            if (clock.ElapsedMilliseconds >= wireTraceDeadline || wireTraceRecords >= 50000)
+            {
+                FinishWireTrace("达到记录上限");
+                return;
+            }
+            try
+            {
+                wireTrace.WriteLine(at.ToString("O", CultureInfo.InvariantCulture) + " " + fields);
+                wireTraceRecords++;
+            }
+            catch (Exception ex) { FinishWireTrace("写入失败 · " + ex.Message); }
+        }
+
+        void FinishWireTrace(string reason)
+        {
+            if (wireTrace == null) return;
+            StreamWriter finished = wireTrace;
+            wireTrace = null;
+            try
+            {
+                using (finished)
+                    finished.WriteLine(PreciseUtcNow().ToString("O", CultureInfo.InvariantCulture) + " end " + reason);
+                log("KMBox 报文记录已保存 · " + wireTracePath + " · " + reason);
+            }
+            catch (Exception ex) { log("KMBox 报文记录保存失败 · " + ex.Message); }
         }
 
         internal void Emergency(bool disconnect)
@@ -412,12 +472,13 @@ namespace VisionHardwareCheck
                                 log(ex.Message + "，重试一次心跳。");
                                 Exchange("监控心跳重试", MonitorCommand, option, null, 350, false);
                             }
-                            if (monitor != null) heartbeatAcksSinceReport++;
                             heartbeatDue = clock.ElapsedMilliseconds + HeartbeatMs;
                         }
+                        if (wireTrace != null && clock.ElapsedMilliseconds >= wireTraceDeadline) FinishWireTrace("达到记录上限");
                     }
                     catch (Exception ex)
                     {
+                        if (wireTrace != null) Trace(PreciseUtcNow(), "lockout reason=transport_failure detail=" + ex.Message);
                         log("KMBox 通信故障：" + ex.Message);
                         halted = true;
                         CloseLink();
@@ -447,10 +508,18 @@ namespace VisionHardwareCheck
                 if (length != ReportSize || !((IPEndPoint)sender).Address.Equals(endpoint.Address))
                 {
                     ignoredReports++;
+                    if (wireTrace != null) Trace(PreciseUtcNow(), "ignored_monitor_datagram size=" + length);
                     continue;
                 }
-                if (lastReport >= 0 && !IsFresh()) UpdateCombo();
                 long now = clock.ElapsedMilliseconds;
+                DateTime receivedAt = PreciseUtcNow();
+                bool previousExpired = lastReport >= 0 && now - lastReport > ReportTimeoutMs;
+                if (previousExpired)
+                {
+                    UpdateCombo();
+                    // Publish the stale edge even when recovery carries an unchanged mask.
+                    Publish();
+                }
                 if (lastReport >= 0) longestGap = (int)Math.Min(int.MaxValue, Math.Max(longestGap, now - lastReport));
                 int keys = report[1] & 31;
                 bool stationary = keys != 0 && BitConverter.ToInt16(report, 2) == 0 &&
@@ -476,10 +545,13 @@ namespace VisionHardwareCheck
 #endif
                 buttons = keys;
                 lastReport = now;
-                lastReportAt = PreciseUtcNow();
+                lastReportAt = receivedAt;
                 reportCount++;
                 heartbeatAcksSinceReport = 0;
                 monitorStatus = "已收到物理报文";
+                if (wireTrace != null) Trace(receivedAt, "physical local_sequence=" + reportCount + " size=" + length +
+                    " mask=" + keys + " expired=false previous_expired=" + previousExpired +
+                    " mouse_bytes=" + BitConverter.ToString(report, 0, 8));
                 UpdateCombo();
                 if (observe != null) Publish();
             }
@@ -516,6 +588,8 @@ namespace VisionHardwareCheck
 #else
                 const string state = "按键状态未知，移动锁止。";
 #endif
+                if (wireTrace != null) Trace(PreciseUtcNow(), "physical_expired local_sequence=" + reportCount +
+                    " last_mask=" + buttons + " age_ms=" + (clock.ElapsedMilliseconds - lastReport) + " expired=true reason=no_fresh_physical_report");
                 log("物理报文 " + ReportTimeoutMs + " ms 内未更新；" + state + "最近静止持键段 " +
                     stationaryReports + " 包 / " + stationaryDuration + " ms，最大间隔 " + stationaryMaxGap + " ms" +
                     "。上次物理报文 #" + reportCount + "，按键掩码 " + buttons +
@@ -558,6 +632,14 @@ namespace VisionHardwareCheck
                     if (size >= HeaderSize && Read32(reply, 8) == packetId && Read32(reply, 12) == opcode)
                     {
                         linkAt = PreciseUtcNow();
+                        if (stage == "监控心跳" || stage == "监控心跳重试")
+                        {
+                            heartbeatAcks++;
+                            if (monitor != null) heartbeatAcksSinceReport++;
+                        }
+                        if (opcode == MonitorCommand && wireTrace != null) Trace(linkAt, "monitor_ack size=" + size +
+                            " sequence=" + packetId + " opcode=0x" + opcode.ToString("X8") + " parameter=0x" +
+                            Read32(reply, 4).ToString("X8") + " refreshes_physical=false");
                         return true;
                     }
                     mismatched++;
@@ -598,7 +680,7 @@ namespace VisionHardwareCheck
             lastReport = -1;
             lastReportAt = default(DateTime);
             reportCount = longestGap = 0;
-            heartbeatAcksSinceReport = 0;
+            heartbeatAcks = heartbeatAcksSinceReport = 0;
 #if KMBOX_INTEGRATION_LOOPBACK || KMBOX_AUTO_TRACKING
             monitorEpochMs = EpochMs(PreciseUtcNow());
             Array.Clear(releasedAtReport, 0, releasedAtReport.Length);
@@ -612,6 +694,7 @@ namespace VisionHardwareCheck
 
         void CloseMonitor()
         {
+            FinishWireTrace("监控已关闭或连接中断");
             if (monitor != null) monitor.Dispose();
             monitor = null;
             monitorPort = 0;
@@ -644,6 +727,7 @@ namespace VisionHardwareCheck
                 Connected = command != null && connection == "盒子已应答", Monitoring = monitor != null,
                 Halted = halted, Busy = busy, Combo = combo, Buttons = IsFresh() ? buttons : -1, Count = count,
                 Reports = reportCount, LongestGap = longestGap, Age = lastReport < 0 ? -1 : clock.ElapsedMilliseconds - lastReport,
+                HeartbeatAcks = heartbeatAcks, TraceActive = wireTrace != null,
                 LastReportAt = lastReportAt, LinkAt = linkAt, Connection = connection, Monitor = monitorStatus,
                 IgnoredReports = ignoredReports, StationaryReports = stationaryReports,
                 StationaryDuration = stationaryDuration, StationaryMaxGap = stationaryMaxGap

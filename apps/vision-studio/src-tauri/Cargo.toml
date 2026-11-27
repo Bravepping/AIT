@@ -6,6 +6,7 @@ edition = "2021"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+kmbox-hold-diagnostics = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

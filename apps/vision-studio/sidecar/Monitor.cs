@@ -26,17 +26,21 @@ internal static class MonitorHost
     static void Publish(KmBox.Snapshot current)
     {
         long now = clock.ElapsedMilliseconds;
-        if (previous != null && now - lastSent < 100 && current.Connected == previous.Connected &&
+        const int updateIntervalMs = 100;
+        bool freshNearDeadline = previous != null && current.Reports > previous.Reports && previous.Age >= 0 &&
+            previous.Age + now - lastSent >= KmBox.ReportTimeoutMs - updateIntervalMs;
+        if (previous != null && !freshNearDeadline && now - lastSent < updateIntervalMs && current.Connected == previous.Connected &&
             current.Monitoring == previous.Monitoring && current.Buttons == previous.Buttons &&
             current.Halted == previous.Halted && current.Busy == previous.Busy && current.Connection == previous.Connection &&
-            current.Monitor == previous.Monitor) return;
+            current.Monitor == previous.Monitor && current.TraceActive == previous.TraceActive) return;
         previous = current;
         lastSent = now;
         Emit(new { kind = "kmbox", connected = current.Connected, monitoring = current.Monitoring,
-            buttons = current.Buttons, reports = current.Reports, age_ms = current.Age, busy = current.Busy,
+            buttons = current.Buttons, combo = current.Combo, reports = current.Reports, age_ms = current.Age, busy = current.Busy,
             report_at_ms = current.Age >= 0 ? KmBox.EpochMs(current.LastReportAt) : 0,
             link_at_ms = current.Connected ? KmBox.EpochMs(current.LinkAt) : 0,
             longest_gap_ms = current.LongestGap, ignored_reports = current.IgnoredReports,
+            heartbeat_acks = current.HeartbeatAcks, wire_trace_active = current.TraceActive,
             stationary_reports = current.StationaryReports, stationary_ms = current.StationaryDuration,
             stationary_max_gap_ms = current.StationaryMaxGap,
             connection = current.Connection, monitor = current.Monitor, halted = current.Halted });
@@ -108,6 +112,9 @@ internal static class MonitorHost
                             break;
                         case "stop_monitor":
                             if (!device.StopMonitor()) throw new InvalidOperationException("KMBox 正忙");
+                            break;
+                        case "trace_wire":
+                            if (!device.StartWireTrace()) throw new InvalidOperationException("KMBox 正忙或已锁止");
                             break;
                         case "disconnect":
                             device.Emergency(true);

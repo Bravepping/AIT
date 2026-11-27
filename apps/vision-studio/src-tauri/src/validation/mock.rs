@@ -80,6 +80,7 @@ fn verify_conversion() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(feature = "kmbox-hold-diagnostics"))]
 fn verify_held_confirmation() -> Result<(), String> {
     let mut gate = setup(MockKmBox::default())?;
     let input_report = |mask, age| {
@@ -108,7 +109,7 @@ fn verify_held_confirmation() -> Result<(), String> {
     check(gate.target_sample().is_none(), "确认恢复后自行触发")?;
 
     for (event, reason) in [("confirmation_lost", "设备 A 持键确认或 KMBox 连接应答已过期"),
-        ("link_lost", "KMBox 监控已断开或报文过期")] {
+        ("link_lost", "KMBox 监控已断开或停止")] {
         let mut gate = setup(MockKmBox::default())?;
         gate.buttons(&input_report(3, 0));
         gate.confirm_buttons(&confirmation(3));
@@ -123,7 +124,7 @@ fn verify_held_confirmation() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "kmbox-hold-diagnostics")))]
 fn check_event_release(mask: u8, release: u8, hold_ms: u64) {
     let mut gate = setup(MockKmBox::default()).unwrap();
     let profile = json!({"mask":mask, "event_preview":true, "enabled_classes":[1]});
@@ -160,12 +161,15 @@ fn check_event_release(mask: u8, release: u8, hold_ms: u64) {
 }
 
 #[test]
+#[cfg(not(feature = "kmbox-hold-diagnostics"))]
 fn right_release_after_6100_ms() { check_event_release(2, 0, 6100); }
 
 #[test]
+#[cfg(not(feature = "kmbox-hold-diagnostics"))]
 fn chord_release_after_6200_ms() { check_event_release(3, 2, 6200); }
 
 #[test]
+#[cfg(not(feature = "kmbox-hold-diagnostics"))]
 fn event_preview_auto_arms_without_mouse_reports_and_rearms_after_release() {
     let mut gate = AutomationController::with_driver(MockKmBox::default());
     let profile = json!({"mask":2, "event_preview":true, "enabled_classes":[1]});
@@ -215,22 +219,101 @@ fn physical_input(mask: u8, report: u64) -> Value {
     event
 }
 
+#[test]
+#[cfg(feature = "kmbox-hold-diagnostics")]
+fn diagnostics_rejects_heartbeat_and_requires_manual_rearm() {
+    let mut gate = setup(MockKmBox::default()).unwrap();
+    let profile = json!({"mask":3,"enabled_classes":[1],"event_preview":true});
+    gate.configure(vec![serde_json::from_value(profile).unwrap()]).unwrap();
+    gate.buttons(&physical_input(0, 1));
+    assert!(gate.arm().is_ok());
+    gate.buttons(&physical_input(3, 2));
+    assert!(gate.target_sample().is_some());
+    let status = json!({"connected":true,"monitoring":true,"buttons":-1,"age_ms":1201,
+        "reports":2,"link_at_ms":now_ms(),"heartbeat_acks":2});
+    let locked = gate.buttons(&status).unwrap();
+    assert_eq!(locked["last_stop"]["reason"], "KMBox 物理按键报文已过期");
+    assert_eq!(locked["last_stop"]["cleared_pending"], true);
+    assert!(locked["candidate"].is_null());
+
+    gate.buttons(&physical_input(0, 3));
+    gate.buttons(&physical_input(3, 4));
+    send_frame(&mut gate, 2, &NEXT);
+    gate.tick();
+    assert!(gate.target_sample().is_none());
+    assert!(gate.movement.driver.sent.is_empty());
+    gate.buttons(&physical_input(0, 5));
+    assert!(gate.arm().is_ok());
+    assert!(gate.buttons(&physical_input(3, 6)).unwrap()["candidate"].is_object());
+    let network = gate.buttons(&json!({"connected":false,"monitoring":false})).unwrap();
+    assert_eq!(network["last_stop"]["reason"], "KMBox 监控已断开或停止");
+    assert!(network["candidate"].is_null());
+    gate.monitor_changed();
+    gate.buttons(&physical_input(0, 1));
+    gate.buttons(&physical_input(3, 2));
+    send_frame(&mut gate, 3, &NEXT);
+    assert!(gate.target_sample().is_none());
+    assert!(gate.movement.driver.sent.is_empty());
+}
+
 #[cfg(test)]
-fn setup_real() -> AutomationController<MockKmBox> {
+fn real_gate(mask: u8, classes: Value) -> AutomationController<MockKmBox> {
     let mut gate = setup(MockKmBox::default()).unwrap();
     gate.request_device("1234ABCD");
     gate.request_named_stream(1, "test-source".into());
     gate.worker(&json!({"kind":"stream_state","state":"live","source":1,"frame_at":now_ms()}));
-    let profile = json!({"mask":3,"enabled_classes":[1],"classes":[1],"event_preview":true,
+    let profile = json!({"mask":mask,"enabled_classes":[1,2],"classes":classes,"event_preview":true,
+        "max_speed":120,"acceleration":1000,
         "calibration_site":{"source":"test-source","device":"1234ABCD","desktop":[2560,1440],"crop":[640,640],"observed":[10,10]}});
     gate.configure(vec![serde_json::from_value(profile).unwrap()]).unwrap();
+    gate
+}
+
+#[cfg(test)]
+fn setup_real() -> AutomationController<MockKmBox> {
+    let mut gate = real_gate(3, json!([1]));
     send_frame(&mut gate, 1, &FIRST);
     assert!(gate.arm_real(1, false).is_err());
     gate.buttons(&physical_input(0, 1));
-    assert!(gate.arm_real(1, true).is_err());
     assert_eq!(gate.arm_real(1, false).unwrap()["mode"], "real");
     assert!(gate.movement.driver.live);
     gate
+}
+
+#[test]
+fn single_hold_and_all_enabled_classes_can_start_directly() {
+    for mask in [1, 2] {
+        verify_single_hold(mask);
+    }
+}
+
+#[cfg(test)]
+fn verify_single_hold(mask: u8) {
+    let mut gate = real_gate(mask, Value::Null);
+    send_frame(&mut gate, 1, &[]);
+    gate.buttons(&physical_input(0, 1));
+    assert_eq!(gate.arm_real(1, true).unwrap()["state"], "Armed");
+    gate.buttons(&physical_input(3 ^ mask, 2));
+    send_frame(&mut gate, 2, &FIRST);
+    assert!(gate.target_sample().is_none());
+    gate.buttons(&physical_input(mask, 3));
+    send_frame(&mut gate, 3, &[]);
+    gate.tick();
+    assert!(gate.movement.driver.sent.is_empty());
+    let another_class = [[320., 320., 360., 360., 0.8, 2.]];
+    for sequence in 4..10 {
+        send_frame(&mut gate, sequence, &another_class);
+        gate.tick();
+        std::thread::sleep(Duration::from_millis(18));
+    }
+    assert!(gate.target_sample().is_some());
+    let sent = gate.movement.driver.sent.len();
+    assert!(sent > 0);
+    let released = gate.buttons(&physical_input(0, 4)).unwrap();
+    assert_eq!(released["state"], "Stopped");
+    gate.tick();
+    assert!(gate.target_sample().is_none());
+    assert_eq!(gate.movement.driver.sent.len(), sent);
 }
 
 #[test]
@@ -332,6 +415,7 @@ fn real_tracking_faults_clear_candidates_and_require_new_arm() {
 pub(super) fn verify() -> Result<Value, String> {
     verify_conversion()?;
     verify_tracking()?;
+    #[cfg(not(feature = "kmbox-hold-diagnostics"))]
     verify_held_confirmation()?;
 
     let mut calibrated = setup(MockKmBox::default())?;

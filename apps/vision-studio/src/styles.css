@@ -57,6 +57,17 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 h1 { margin: 0; font-size: 29px; font-weight: 760; letter-spacing: -.075rem; }
 .engine-active { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--accent); }
 .overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 310px); gap: 16px; }
+.work-setup { grid-column: 1 / -1; border-color: #315247; }
+.work-setup-main { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.work-setup-main h2 { margin-bottom: 5px; }
+.work-setup-main p { margin: 0; color: var(--muted); font-size: 13px; }
+.work-start-on-open { display: flex; align-items: center; gap: 7px; width: fit-content; margin: 12px 0 0; }
+.work-source { margin: 11px 0 0; max-width: 28rem; }
+.advanced-motion { margin-top: 15px; }
+.advanced-motion[open] > summary { margin-bottom: 11px; }
+.real-start-panel { display: grid; gap: 8px; padding: 12px; border: 1px solid #344457; border-radius: 8px; }
+.real-start-panel h3 { font-size: 14px; margin: 0; }
+.real-start-panel .status, .real-start-panel .button-group { margin: 0; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px; }
 .configuration { display: grid; align-content: start; gap: 16px; }
 .card {

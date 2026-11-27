@@ -3,10 +3,12 @@ param(
     [switch]$CompileOnly,
     [switch]$KmCalibration,
     [switch]$AutoTracking,
+    [switch]$KmHoldDiagnostics,
     [string]$NsisCompiler,
     [ValidatePattern('^[a-zA-Z0-9.-]+$')][string]$PackageName = 'VisionStudio-V1.1'
 )
 $ErrorActionPreference = 'Stop'
+if ($KmHoldDiagnostics -and $AutoTracking) { throw 'KMBox hold diagnostics cannot enable automatic movement' }
 $root = Split-Path $PSScriptRoot -Parent
 $app = Join-Path $root 'apps/vision-studio'
 $build = Join-Path $root 'build'
@@ -28,15 +30,19 @@ if (Test-Path -LiteralPath (Join-Path $toolchain 'rustup')) {
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = Join-Path $msvcBin 'link.exe'
 }
 $env:CARGO_TARGET_DIR = $target
+$previousDiagnostics = $env:VITE_KMBOX_HOLD_DIAGNOSTICS
+$env:VITE_KMBOX_HOLD_DIAGNOSTICS = if ($KmHoldDiagnostics) { '1' } else { '0' }
+$cargoFeatures = if ($KmHoldDiagnostics) { 'custom-protocol,kmbox-hold-diagnostics' } else { 'custom-protocol' }
 Push-Location $app
 try {
     npm exec -- vue-tsc --noEmit
     if ($LASTEXITCODE -ne 0) { throw 'Vue type check failed' }
     npm run build
     if ($LASTEXITCODE -ne 0) { throw 'Vue production build failed' }
-    cargo build --manifest-path src-tauri/Cargo.toml --release --features custom-protocol --target x86_64-pc-windows-msvc
+    cargo build --manifest-path src-tauri/Cargo.toml --release --features $cargoFeatures --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Tauri release build failed' }
 } finally {
+    $env:VITE_KMBOX_HOLD_DIAGNOSTICS = $previousDiagnostics
     Pop-Location
 }
 $exe = Join-Path $target 'x86_64-pc-windows-msvc/release/vision-studio.exe'
@@ -59,6 +65,9 @@ if (!$model) { $model = Join-Path $env:USERPROFILE 'Downloads/1013v26s_640.onnx'
 Copy-Item -LiteralPath $model -Destination (Join-Path $stage '1013v26s_640.onnx')
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'VisionStudio.exe')
 Copy-Item -LiteralPath (Join-Path $app 'README.md') -Destination $stage
+if ($KmHoldDiagnostics) {
+    Copy-Item -LiteralPath (Join-Path $root 'docs/kmbox-net-hold-validation.md') -Destination $stage
+}
 foreach ($name in 'Start-Vision-CUDA.cmd','README-CUDA.txt','setup-vision-cuda.py','cuda-packages.json') {
     Copy-Item -LiteralPath (Join-Path $root "apps/cuda-runtime-setup/$name") -Destination $stage
 }
@@ -74,13 +83,15 @@ $compilerArgs = @('/nologo','/platform:x64','/target:exe','/optimize+','/warnase
 & $compiler @compilerArgs
 if ($LASTEXITCODE -ne 0) { throw 'KMBox monitor build failed' }
 $binaries = @((Join-Path $stage 'VisionStudio.exe'), $monitor)
-$confirmation = Join-Path $stage 'VisionButtonStatus.exe'
-$confirmationArgs = @('/nologo','/platform:x64','/target:winexe','/optimize+','/warnaserror+','/codepage:65001',
-    '/r:System.Windows.Forms.dll','/r:System.Drawing.dll',"/out:$confirmation",
-    (Join-Path $app 'sidecar/ButtonStatusApp.cs'), (Join-Path $app 'sidecar/ButtonConfirmation.cs'))
-& $compiler @confirmationArgs
-if ($LASTEXITCODE -ne 0) { throw 'Device A button confirmation build failed' }
-$binaries += $confirmation
+if (!$KmHoldDiagnostics) {
+    $confirmation = Join-Path $stage 'VisionButtonStatus.exe'
+    $confirmationArgs = @('/nologo','/platform:x64','/target:winexe','/optimize+','/warnaserror+','/codepage:65001',
+        '/r:System.Windows.Forms.dll','/r:System.Drawing.dll',"/out:$confirmation",
+        (Join-Path $app 'sidecar/ButtonStatusApp.cs'), (Join-Path $app 'sidecar/ButtonConfirmation.cs'))
+    & $compiler @confirmationArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Device A button confirmation build failed' }
+    $binaries += $confirmation
+}
 if ($KmCalibration) {
     $calibration = Join-Path $stage 'VisionKmCalibration.exe'
     $hardware = Join-Path $root 'apps/hardware-check'

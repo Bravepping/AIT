@@ -1,6 +1,10 @@
-# NDI AI Vision Control V1.6
+# NDI AI Vision Control V1.7 Release Candidate
 
-设备 A 推送 NDI。设备 B 启动 `VisionStudio.exe`，接收视频并加载 TensorRT FP16。新装环境需要 WebView2、NDI Runtime 和 NVIDIA 运行组件。可复用 V1.5 的 `vision-runtime\cuda-libraries` 和 `vision-runtime\trt-packages`，也可以使用随包安装脚本。
+设备 A 推送 NDI。设备 B 安装 V1.7 RC，或解压便携包后启动 `VisionStudio.exe`。需要 WebView2、NDI Runtime 和 NVIDIA 运行组件。可复用 V1.5 的 `vision-runtime\cuda-libraries` 和 `vision-runtime\trt-packages`，也可以使用随包安装脚本。
+
+## 配置迁移
+
+程序读取原有热键、校准和设备偏好。在「热键管理」可导出 JSON、导入其他配置，也可恢复上次导入前的设置。文件校验通过后才应用。应用时停止跟随，真实控制需要重新武装。设备地址变化时按新地址重新连接。配对码和真实发送状态使用当前会话。
 
 ## 跟踪与算法设置
 
@@ -24,4 +28,4 @@
 
 KMBox 固件在静止按住时可能停止上报，真实跟随会在物理状态超过 1200 ms 后锁止。等待下一次候选的 Dry Run 可按上次事件保持。单独校准支持小幅手动发送。真实跟随期间每次最多一条在途命令，当前候选替换待处理的旧命令。
 
-构建使用 `scripts/build-vision-studio-v11.ps1 -PackageName VisionStudio-V1.6-Tracking -KmCalibration -AutoTracking`。
+构建使用 `scripts/build-vision-studio-v11.ps1 -PackageName VisionStudio-V1.7-RC -KmCalibration -AutoTracking -NsisCompiler <makensis.exe>`。

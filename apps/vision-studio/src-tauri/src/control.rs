@@ -417,13 +417,13 @@ impl<D: KmBoxDriver> AutomationController<D> {
             model_ready: false, frame: None, lock: TargetLock::default(), smoothing: Smoothing::default(),
             candidate: None, movement: Dispatcher::new(driver), last_ui: None }
     }
-    pub fn configure(&mut self, profiles: Vec<Profile>) -> Result<Value, String> {
+    pub fn validate_profiles(profiles: &[Profile]) -> Result<(), String> {
         if profiles.len() > 31 {
             return Err("最多保存 31 个启用方案".into());
         }
         let mut masks = HashSet::new();
         let mut ids = HashSet::new();
-        for profile in &profiles {
+        for profile in profiles {
             profile.validate()?;
             if !masks.insert(profile.mask) {
                 return Err(format!("热键冲突：{} 与其他启用方案使用相同按键", profile.name));
@@ -432,6 +432,11 @@ impl<D: KmBoxDriver> AutomationController<D> {
                 return Err("热键方案编号重复".into());
             }
         }
+        Ok(())
+    }
+
+    pub fn configure(&mut self, profiles: Vec<Profile>) -> Result<Value, String> {
+        Self::validate_profiles(&profiles)?;
         self.leave_real();
         self.bindings = profiles.into_iter().map(|profile| Binding { profile, released: false, down: false, latched: false }).collect();
         self.reset_activation();
@@ -919,6 +924,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
                "mode":if self.real.is_some() { "real" } else { "dry_run" },
                "real_control_available":self.real.is_some(),
                "scheduled":self.movement.submitted, "expired":self.movement.expired,
+               "queue_ms":self.movement.last_queue_ms,
                "hold_confirmed":self.confirmed_hold(),
                "event_hold_age_ms":self.report_at.filter(|at| self.event_preview() && at.elapsed() > BUTTON_TIMEOUT)
                    .map(|at| at.elapsed().as_millis() as u64)})
@@ -934,6 +940,10 @@ impl<D: KmBoxDriver> AutomationController<D> {
 
     pub(crate) fn target_sample(&self) -> Option<(u64, u64, f64)> {
         self.current_candidate().map(|candidate| (candidate.sequence, candidate.latency_ms, candidate.decision_ms))
+    }
+
+    pub(crate) fn target_track(&self) -> Option<u64> {
+        self.current_candidate().map(|candidate| candidate.track_id)
     }
 
     pub(crate) fn live_fault(&mut self, reason: &'static str) -> Option<Value> {

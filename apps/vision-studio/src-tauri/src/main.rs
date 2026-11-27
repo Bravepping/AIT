@@ -382,11 +382,11 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
                 if event["kind"] == "move_status" {
                     if let Ok(mut gate) = safety.gate.lock() {
                         let id = event["id"].as_u64().unwrap_or_default();
-                        if let Some((target, elapsed)) = gate.movement.driver.result(id) {
+                        if let Some((target, elapsed, queue_ms)) = gate.movement.driver.result(id) {
                             let (target, class, frame_at) = target.unwrap_or_default();
                             safety.event(json!({"kind":"move_receipt", "id":id, "target":target, "class":class,
                                 "dx":event["dx"], "dy":event["dy"], "status":event["status"],
-                                "exchange_ms":event["elapsed_ms"], "dispatch_ms":elapsed.as_secs_f64()*1000.0,
+                                "queue_ms":queue_ms, "exchange_ms":event["elapsed_ms"], "dispatch_ms":elapsed.as_secs_f64()*1000.0,
                                 "receiver_ms":control::now_ms().saturating_sub(frame_at)}));
                             if event["status"] == "acknowledged" {
                                 gate.record_trial_ack();
@@ -452,6 +452,11 @@ fn configure_gate(state: State<DryRunState>, profiles: Vec<Profile>) -> Result<(
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+fn validate_profile_backup(profiles: Vec<Profile>) -> Result<(), String> {
+    AutomationController::<movement::DryRunDriver>::validate_profiles(&profiles)
 }
 
 #[tauri::command]
@@ -609,7 +614,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            start_worker, send_worker, send_monitor, open_kmbox_acceptance, configure_gate, arm_gate, arm_real_tracking, stop_gate, estimate_calibration, list_models, report_frontend_ready, export_log
+            start_worker, send_worker, send_monitor, open_kmbox_acceptance, configure_gate, validate_profile_backup, arm_gate, arm_real_tracking, stop_gate, estimate_calibration, list_models, report_frontend_ready, export_log
         ])
         .build(tauri::generate_context!())
         .expect("build NDI Vision Control");

@@ -80,6 +80,7 @@ export type DryRun = {
   profile_id?: number | null; profile_name?: string | null
   mode: 'dry_run' | 'real'; real_control_available: boolean
   scheduled?: number; expired?: number
+  queue_ms?: number | null
   hold_confirmed?: boolean
   event_hold_age_ms?: number | null
 }
@@ -112,5 +113,5 @@ export type WorkerEvent =
   | { kind: 'cuda_check'; status: string; details?: string[] }
   | { kind: 'kmbox_error'; error: string }
   | { kind: 'move_receipt'; id: number; target: number; class: number; dx: number; dy: number;
-      status: string; exchange_ms: number; dispatch_ms: number; receiver_ms: number }
+      status: string; queue_ms: number; exchange_ms: number; dispatch_ms: number; receiver_ms: number }
   | { kind: 'log'; text: string }

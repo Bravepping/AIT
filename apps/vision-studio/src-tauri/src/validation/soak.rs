@@ -1,6 +1,7 @@
 use super::{input, AutomationController, Duration, Instant};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 struct Totals {
@@ -33,6 +34,13 @@ pub(super) fn verify() -> Result<(), String> {
     let mut initially_armed = false;
     let mut failed = false;
     let mut last_sequence = None;
+    let mut tracks = BTreeSet::new();
+    let mut track_changes = 0;
+    let mut losses = 0;
+    let mut previous_track = None;
+    let mut last_submitted = 0;
+    let mut queue_total = 0.0;
+    let mut queue_peak: f64 = 0.0;
     let mut window = Totals::default();
     let mut total = Totals::default();
     let mut last_report = Instant::now();
@@ -65,6 +73,22 @@ pub(super) fn verify() -> Result<(), String> {
                 total.add(latency_ms, decision_ms);
             }
         }
+        if detection {
+            let track = gate.target_track();
+            if let Some(id) = track { tracks.insert(id); }
+            if let Some(previous) = previous_track {
+                losses += usize::from(track.is_none());
+                track_changes += usize::from(track.is_some_and(|next| next != previous));
+            }
+            previous_track = track;
+        }
+        if gate.movement.submitted > last_submitted {
+            last_submitted = gate.movement.submitted;
+            if let Some(wait) = gate.movement.last_queue_ms {
+                queue_total += wait;
+                queue_peak = queue_peak.max(wait);
+            }
+        }
         if last_report.elapsed() >= Duration::from_secs(1) {
             write_line(&mut output, json!({"event":"controller_sample","timings":window.metrics(),
                 "target":gate.target_update(), "dry_run_scheduled":gate.movement.submitted}))?;
@@ -73,7 +97,10 @@ pub(super) fn verify() -> Result<(), String> {
         }
     }
     write_line(&mut output, json!({"event":"controller_summary","timings":total.metrics(),
-        "dry_run_scheduled":gate.movement.submitted,"mode":"dry_run","input":"simulated buttons","fault":failed}))
+        "dry_run_scheduled":gate.movement.submitted,"mode":"dry_run","input":"simulated buttons","fault":failed,
+        "distinct_track_ids":tracks.len(),"continuous_id_changes":track_changes,"candidate_losses":losses,
+        "queue_avg_ms":(last_submitted > 0).then(|| queue_total / last_submitted as f64),
+        "queue_max_ms":(last_submitted > 0).then_some(queue_peak)}))
 }
 
 fn write_line(output: &mut impl Write, value: Value) -> Result<(), String> {

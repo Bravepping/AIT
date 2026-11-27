@@ -25,6 +25,7 @@ pub struct MoveContext {
     pub expires_at_ms: u64,
     pub held: Option<HeldInput>,
     target: Option<(u64, u16, u64)>,
+    queue_ms: f64,
 }
 
 pub trait KmBoxDriver {
@@ -92,11 +93,11 @@ pub(crate) struct RuntimeDriver {
 }
 
 impl RuntimeDriver {
-    pub fn result(&mut self, id: u64) -> Option<(Option<(u64, u16, u64)>, Duration)> {
+    pub fn result(&mut self, id: u64) -> Option<(Option<(u64, u16, u64)>, Duration, f64)> {
         let (pending, started) = self.outstanding?;
         if id != pending.id { return None; }
         self.outstanding = None;
-        Some((pending.target, started.elapsed()))
+        Some((pending.target, started.elapsed(), pending.queue_ms))
     }
 
     pub fn timed_out(&self) -> bool {
@@ -163,12 +164,14 @@ pub struct Dispatcher<D> {
     last: Option<(Instant, u64)>,
     pub(crate) submitted: u64,
     pub(crate) expired: u64,
+    pub(crate) last_queue_ms: Option<f64>,
     live_rate: [f64; 2],
 }
 
 impl<D: KmBoxDriver> Dispatcher<D> {
     pub fn new(driver: D) -> Self {
-        Self { driver, pending: None, last: None, submitted: 0, expired: 0, live_rate: [0.0; 2] }
+        Self { driver, pending: None, last: None, submitted: 0, expired: 0,
+            last_queue_ms: None, live_rate: [0.0; 2] }
     }
 
     pub fn offer(&mut self, frame_at: u64, sequence: u64, [dx, dy]: [i32; 2], now: Instant, held: Option<HeldInput>) {
@@ -192,6 +195,7 @@ impl<D: KmBoxDriver> Dispatcher<D> {
     pub fn clear(&mut self) {
         self.pending = None;
         self.live_rate = [0.0; 2];
+        self.last_queue_ms = None;
     }
 
     pub fn reset_stream(&mut self) {
@@ -221,10 +225,12 @@ impl<D: KmBoxDriver> Dispatcher<D> {
         self.pending = None;
         let movement = self.limit_live(command);
         if movement.dx != 0 || movement.dy != 0 {
+            let queue_ms = now.saturating_duration_since(command.created).as_secs_f64() * 1000.0;
             let context = MoveContext { id: self.submitted + 1, expires_at_ms: command.expires_at_ms,
-                held: command.held, target: command.target };
+                held: command.held, target: command.target, queue_ms };
             self.driver.submit_relative(movement, context)?;
             self.submitted += 1;
+            self.last_queue_ms = Some(queue_ms);
         }
         self.last = Some((now, command.sequence));
         Ok(())

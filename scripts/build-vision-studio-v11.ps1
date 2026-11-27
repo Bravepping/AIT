@@ -3,6 +3,7 @@ param(
     [switch]$CompileOnly,
     [switch]$KmCalibration,
     [switch]$AutoTracking,
+    [string]$NsisCompiler,
     [ValidatePattern('^[a-zA-Z0-9.-]+$')][string]$PackageName = 'VisionStudio-V1.1'
 )
 $ErrorActionPreference = 'Stop'
@@ -101,3 +102,13 @@ $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant
 "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath ($zip + '.sha256') -Encoding ascii
 Write-Output $zip
 Write-Output "SHA256 $hash"
+if ($NsisCompiler) {
+    $compilerPath = (Resolve-Path -LiteralPath $NsisCompiler).Path
+    $setup = Join-Path $dist "$PackageName-windows-x64-setup.exe"
+    & $compilerPath '/V2' '/INPUTCHARSET' 'UTF8' "/DPAYLOAD_DIR=$stage" "/DSETUP_EXE=$setup" (Join-Path $PSScriptRoot 'vision-studio-installer.nsi')
+    if ($LASTEXITCODE -ne 0) { throw 'NSIS installer build failed' }
+    $setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$setupHash  $([IO.Path]::GetFileName($setup))" | Set-Content -LiteralPath ($setup + '.sha256') -Encoding ascii
+    Write-Output $setup
+    Write-Output "SHA256 $setupHash"
+}

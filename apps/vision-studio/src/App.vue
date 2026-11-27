@@ -1,63 +1,29 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core'
 import { engines, type Engine, type Command, type MonitorCommand, type WorkerEvent, type Stream,
   type Inference, type Backend, type Gpu, type KmBox, type DryRun } from './protocol'
+import { classIds, newProfile, migrateProfile, makeBackup, parseBackup, type Profile, type Preferences, type Backup } from './configuration'
 
 const engineOptions = engines
 const pages = ['总览', '设备连接', '推理设置', '热键管理', '目标识别', '鼠标控制', '运行日志'] as const
 const page = ref<typeof pages[number]>('总览')
 const pointerKeys = ['左键', '右键', '中键', 'Mouse4', 'Mouse5']
-const classIds = [0, 1, 2, 3, 4, 5, 6]
 const previewRates = [5, 10, 15, 30, 60]
 type Source = { name: string; url: string; key: string }
-type Profile = {
-  id: number; name: string; mask: number; mode: 'hold' | 'toggle'; scope: 'all' | 'single' | 'custom';
-  single: number; classes: number[]; priority: 'closest' | 'confidence' | 'largest';
-  enabled: boolean; confidence: number; anchorX: number; anchorY: number; rangePercent: number;
-  gainX: number; gainY: number; invertX: boolean; invertY: boolean; maxStep: number
-  deadZonePx: number; smoothHalfLifeMs: number; switchConfirmFrames: number
-  calibration?: { observedX: number; observedY: number; source?: string; device?: string;
-    desktop?: [number, number]; crop?: [number, number] }
-  eventPreview?: boolean
-  classRules: Record<number, { threshold: number | ''; priority: number; anchor?: [number, number] }>
-  deadZoneAxes?: [number, number]
-  maxSpeed: number
-  acceleration: number
-  trackingGain: [number, number]
-  referenceX: number
-  referenceY: number
-  lostWaitMs: number
-  dynamicRange?: number
-  motion: { algorithm: 'p' | 'pd'; derivativeMs: [number, number]; predictionMs: number; slowRadiusPx: number; adaptive: boolean }
-}
 const profilesKey = 'vision-v11-profiles'
-const newProfile = (id: number): Profile => ({
-  id, name: id === 1 ? '左右键组合' : `方案 ${id}`, mask: 3, mode: 'hold', scope: 'all',
-  single: 0, classes: [...classIds], priority: 'closest', enabled: id === 1,
-  confidence: 55, anchorX: 0, anchorY: 0, rangePercent: 100,
-  gainX: 1, gainY: 1, invertX: false, invertY: false, maxStep: 24,
-  deadZonePx: 2, smoothHalfLifeMs: 12, switchConfirmFrames: 2,
-  classRules: Object.fromEntries(classIds.map(id => [id, { threshold: '', priority: 0 }])),
-  maxSpeed: 480, acceleration: 4000, trackingGain: [0.35, 0.35],
-  referenceX: 50, referenceY: 50,
-  lostWaitMs: 120,
-  motion: { algorithm: 'p', derivativeMs: [16, 16], predictionMs: 0, slowRadiusPx: 0, adaptive: false },
-})
 function saved<T>(key: string, fallback: T): T {
   try { return JSON.parse(localStorage.getItem(key) ?? 'null') ?? fallback }
   catch { return fallback }
 }
 const profiles = ref(saved(profilesKey, [newProfile(1)]))
 if (!Array.isArray(profiles.value) || !profiles.value.length) profiles.value = [newProfile(1)]
-profiles.value = profiles.value.map((entry) => ({ ...newProfile(entry.id), ...entry,
-  lostWaitMs: entry.lostWaitMs ?? 0,
-  maxStep: Math.min(24, Math.max(1, Number(entry.maxStep) || 24)) }))
-const selection = ref(profiles.value[0]!.id)
+profiles.value = profiles.value.map(migrateProfile)
+const selection = ref(saved('vision-v17-selection', profiles.value[0]!.id))
 const profile = computed(() => profiles.value.find((entry) => entry.id === selection.value) ?? profiles.value[0]!)
 const enabledClasses = ref(saved('vision-v11-enabled-classes', [...classIds]))
 const preferencesKey = 'vision-v13-settings'
-const preferences = saved(preferencesKey, {
+const preferences = saved<Preferences>(preferencesKey, {
   boxAddress: '', boxPort: '' as number | '', boxUuid: '', monitorPort: 12345,
   engine: 'TensorRT' as Engine, model: '1013v26s_640.onnx', source: '', preview: 30,
 })
@@ -66,6 +32,11 @@ const boxPort = ref<number | ''>(preferences.boxPort ?? '')
 const boxUuid = ref(preferences.boxUuid ?? '')
 const monitorPort = ref(preferences.monitorPort ?? 12345)
 const boxError = ref('')
+const configBusy = ref(false)
+const backupInput = ref<HTMLInputElement | null>(null)
+const previousBackup = ref(saved<Backup | null>('vision-v17-previous-backup', null))
+const configStatus = ref('')
+const configFailed = ref(false)
 const inputPairing = ref('')
 const kmBox = shallowRef<KmBox | null>(null)
 const dryRun = shallowRef<DryRun>({ kind: 'dry_run', state: 'Idle', armed: false, active: false,
@@ -378,11 +349,11 @@ async function applyCalibration() {
   }
 }
 
-function syncProfiles() {
-  const configs = profiles.value.filter((entry) => entry.enabled).map((entry) => ({
+function profilePayload(entries: Profile[], classes: number[]) {
+  return entries.filter((entry) => entry.enabled).map((entry) => ({
     id: entry.id, name: entry.name, mask: entry.mask, toggle: entry.mode === 'toggle',
     event_preview: entry.mode === 'hold' && entry.eventPreview === true,
-    enabled_classes: [...enabledClasses.value],
+    enabled_classes: [...classes],
     classes: entry.scope === 'all' ? null : entry.scope === 'single' ? [entry.single] : [...entry.classes],
     priority: entry.priority, confidence: entry.confidence / 100, anchor_x: entry.anchorX, anchor_y: entry.anchorY,
     range_percent: entry.rangePercent,
@@ -404,6 +375,10 @@ function syncProfiles() {
           desktop: entry.calibration.desktop, crop: entry.calibration.crop,
           observed: [entry.calibration.observedX, entry.calibration.observedY] } : undefined,
   }))
+}
+
+function syncProfiles() {
+  const configs = profilePayload(profiles.value, enabledClasses.value)
   profileSync = profileSync.then(async () => {
     try {
       await invoke('configure_gate', { profiles: configs })
@@ -417,7 +392,86 @@ function syncProfiles() {
   return profileSync
 }
 
+function snapshotConfiguration(): Backup {
+  return makeBackup(profiles.value, enabledClasses.value, selection.value, {
+    boxAddress: boxAddress.value, boxPort: boxPort.value, boxUuid: boxUuid.value, monitorPort: monitorPort.value,
+    engine: requestedEngine.value, model: selectedModel.value, source: preferredSource.value, preview: preferredPreview.value,
+  })
+}
+
+function exportConfiguration() {
+  configFailed.value = false
+  const blob = new Blob([JSON.stringify(snapshotConfiguration(), null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'ndi-vision-v17-configuration.json'
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500)
+  configStatus.value = '已请求保存配置文件'
+}
+
+async function applyConfiguration(serialized: string) {
+  const backup = parseBackup(serialized)
+  await invoke('validate_profile_backup', { profiles: profilePayload(backup.profiles, backup.enabledClasses) })
+  await profileSync
+  controlsRevision++
+  await invoke('stop_gate')
+  const existing = snapshotConfiguration()
+  const previous = JSON.stringify(existing)
+  const { preferences: next } = backup
+  if (kmBox.value?.connected && (
+    next.boxAddress !== existing.preferences.boxAddress || next.boxPort !== existing.preferences.boxPort ||
+    next.boxUuid !== existing.preferences.boxUuid || next.monitorPort !== existing.preferences.monitorPort)) {
+    await invoke('send_monitor', { command: { cmd: 'disconnect' } })
+  }
+  if (streamState.value !== 'idle' && next.source !== existing.preferences.source) await changeStream(null)
+  localStorage.setItem('vision-v17-previous-backup', previous)
+  previousBackup.value = JSON.parse(previous)
+  dryRunPassed.value = stepPassed.value = fullPassed.value = false
+  controlMode.value = 'dry_run'
+  profiles.value = backup.profiles
+  enabledClasses.value = backup.enabledClasses
+  selection.value = backup.selection
+  boxAddress.value = next.boxAddress
+  boxPort.value = next.boxPort
+  boxUuid.value = next.boxUuid
+  monitorPort.value = next.monitorPort
+  requestedEngine.value = next.engine
+  selectedModel.value = next.model
+  preferredSource.value = next.source
+  preferredPreview.value = next.preview
+  await nextTick()
+  if (ready.value && !(await syncProfiles())) throw new Error(profileError.value)
+}
+
+async function changeConfiguration(read: () => Promise<string>, success: string) {
+  if (configBusy.value) return
+  configBusy.value = true
+  configFailed.value = false
+  try {
+    await applyConfiguration(await read())
+    configStatus.value = success
+    addLog(success)
+  } catch (error) {
+    configFailed.value = true
+    configStatus.value = asText(error)
+  } finally { configBusy.value = false }
+}
+
+function importConfiguration(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  return changeConfiguration(async () => {
+    if (file.size > 1024 * 1024) throw new Error('配置文件超出 1 MB')
+    return file.text()
+  }, '已导入配置，真实跟随需要重新武装')
+}
+
 async function setDryRun(enabled: boolean) {
+  if (enabled && configBusy.value) return
   const revision = ++controlsRevision
   dryError.value = ''
   try {
@@ -430,7 +484,7 @@ async function setDryRun(enabled: boolean) {
 }
 
 async function armReal() {
-  if (realArming.value) return
+  if (realArming.value || configBusy.value) return
   realArming.value = true
   const revision = ++controlsRevision
   dryError.value = ''
@@ -602,7 +656,7 @@ function readEvent(message: WorkerEvent) {
       addLog(boxError.value, 'error')
       break
     case 'move_receipt':
-      addLog(`KMBox #${message.id} · 锁定 ${message.target} · 类别 ${message.class} · dx/dy (${message.dx}, ${message.dy}) · ${message.status} · 交换 ${message.exchange_ms} ms · 收帧到结果 ${message.receiver_ms} ms`,
+      addLog(`KMBox #${message.id} · 锁定 ${message.target} · 类别 ${message.class} · dx/dy (${message.dx}, ${message.dy}) · ${message.status} · 队列 ${format(message.queue_ms, 2)} ms · 交换 ${message.exchange_ms} ms · 收帧到结果 ${message.receiver_ms} ms`,
         message.status === 'acknowledged' ? 'info' : 'error')
       break
     case 'dry_run': {
@@ -644,8 +698,10 @@ watch([profiles, enabledClasses], () => {
   if (dryRun.value.armed) void invoke('stop_gate').catch((error) => { dryError.value = asText(error) })
   localStorage.setItem(profilesKey, JSON.stringify(profiles.value))
   localStorage.setItem('vision-v11-enabled-classes', JSON.stringify(enabledClasses.value))
-  if (ready.value) void syncProfiles()
+  if (ready.value && !configBusy.value) void syncProfiles()
 }, { deep: true })
+
+watch(selection, (id) => localStorage.setItem('vision-v17-selection', JSON.stringify(id)))
 
 watch([boxAddress, boxPort, boxUuid, monitorPort, requestedEngine, selectedModel, preferredSource, preferredPreview], () => {
   localStorage.setItem(preferencesKey, JSON.stringify({ boxAddress: boxAddress.value, boxPort: boxPort.value,
@@ -670,7 +726,7 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
 
 <template>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.6</small></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.7 RC</small></div>
     <div class="top-actions">
       <div class="process-state"><span class="dot" :class="workerState"></span>
         {{ ready ? '设备 B · 推理进程就绪' : workerState === 'starting' ? '启动推理进程' : '推理进程不可用' }}
@@ -877,6 +933,14 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
           <p class="status">同时匹配多个方案时，优先触发按键更多的组合。同等键数按列表顺序。配置自动保存。</p>
           <p v-if="conflicts.length" class="status fault" role="alert">按键重复：{{ conflicts.map(entry => entry.name).join('、') }}</p>
           <p v-else-if="profileError" class="status fault" role="alert">{{ profileError }}</p>
+          <div class="button-group">
+            <button class="button" type="button" :disabled="configBusy" @click="exportConfiguration">导出配置</button>
+            <button class="button" type="button" :disabled="configBusy || realArming" @click="backupInput?.click()">导入配置</button>
+            <button class="button" type="button" :disabled="configBusy || realArming || !previousBackup"
+              @click="changeConfiguration(async () => JSON.stringify(previousBackup), '已恢复上次导入前的配置')">恢复上次配置</button>
+            <input ref="backupInput" type="file" accept=".json,application/json" hidden @change="importConfiguration" />
+          </div>
+          <p v-if="configStatus" class="status" :class="{ fault: configFailed }" aria-live="polite">{{ configStatus }}</p>
         </section>
         <section class="card">
           <h2>物理按键与触发方式</h2>
@@ -1039,6 +1103,7 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
             <div><dt>目标速度 X/Y</dt><dd>{{ candidate ? candidate.target_velocity_px_s.map(v => format(v)).join(' / ') + ' px/s' : '—' }}</dd></div>
             <div><dt>当前有效半径</dt><dd>{{ candidate ? format(candidate.range_px) + ' px' : '—' }}</dd></div>
             <div><dt>已调度 / 已过期</dt><dd>{{ dryRun.scheduled ?? 0 }} / {{ dryRun.expired ?? 0 }}</dd></div>
+            <div><dt>最近一次队列等待</dt><dd>{{ format(dryRun.queue_ms, 2) }} ms</dd></div>
             <div><dt>检测框中心</dt><dd>{{ candidate?.center.map(v => format(v)).join(', ') ?? '—' }}</dd></div>
             <div><dt>锁定点</dt><dd>{{ candidate?.anchor.map(v => format(v)).join(', ') ?? '—' }}</dd></div>
             <div><dt>参考点</dt><dd>{{ candidate?.reference.join(', ') ?? '—' }}</dd></div>

@@ -367,6 +367,24 @@ pub enum AutomationState {
     Fault,
 }
 
+#[derive(Serialize)]
+struct StopDiagnostic {
+    id: u64,
+    at_ms: u64,
+    reason: &'static str,
+    previous_state: AutomationState,
+    mode: &'static str,
+    video_frame_at_ms: Option<u64>,
+    video_age_ms: Option<u64>,
+    inference_frame_at_ms: Option<u64>,
+    inference_age_ms: Option<u64>,
+    age_limit_ms: u64,
+    frame_sequence: Option<u64>,
+    track_id: Option<u64>,
+    button_age_ms: Option<u64>,
+    cleared_pending: bool,
+}
+
 pub struct AutomationController<D = DryRunDriver> {
     bindings: Vec<Binding>,
     state: AutomationState,
@@ -394,6 +412,7 @@ pub struct AutomationController<D = DryRunDriver> {
     candidate: Option<(u64, Candidate)>,
     pub(crate) movement: Dispatcher<D>,
     last_ui: Option<Instant>,
+    last_stop: Option<StopDiagnostic>,
 }
 
 struct RealTracking {
@@ -415,7 +434,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
             buttons: 0, report_at: None, physical_report: None, confirmation: None, confirmation_used: false,
             link_at: 0, source: 0, source_name: String::new(), device: String::new(), model: 0, stream_live: false, video_at: None,
             model_ready: false, frame: None, lock: TargetLock::default(), smoothing: Smoothing::default(),
-            candidate: None, movement: Dispatcher::new(driver), last_ui: None }
+            candidate: None, movement: Dispatcher::new(driver), last_ui: None, last_stop: None }
     }
     pub fn validate_profiles(profiles: &[Profile]) -> Result<(), String> {
         if profiles.len() > 31 {
@@ -474,6 +493,20 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     fn stop(&mut self, state: AutomationState, reason: &'static str) -> Value {
+        if state == AutomationState::Stopped || (state == AutomationState::Fault && self.state != AutomationState::Fault) {
+            let at = now_ms();
+            let inference_frame_at = self.frame.as_ref().map(|frame| frame.frame_at);
+            self.last_stop = Some(StopDiagnostic {
+                id: self.last_stop.as_ref().map_or(1, |stop| stop.id + 1), at_ms: at, reason,
+                previous_state: self.state, mode: if self.real.is_some() { "real" } else { "dry_run" },
+                video_frame_at_ms: self.video_at, video_age_ms: self.video_at.and_then(|time| at.checked_sub(time)),
+                inference_frame_at_ms: inference_frame_at, inference_age_ms: inference_frame_at.and_then(|time| at.checked_sub(time)),
+                age_limit_ms: FRAME_TIMEOUT_MS, frame_sequence: self.frame.as_ref().map(|frame| frame.sequence),
+                track_id: self.candidate.as_ref().map(|(_, candidate)| candidate.track_id),
+                button_age_ms: self.report_at.map(|time| time.elapsed().as_millis() as u64),
+                cleared_pending: self.movement.has_pending(),
+            });
+        }
         self.leave_real();
         self.reset_activation();
         self.state = state;
@@ -620,10 +653,11 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     pub fn monitor_failed(&mut self) -> Value {
-        self.report_at = None;
         self.link_at = 0;
         self.buttons = 0;
-        self.stop(AutomationState::Fault, "KMBox 监控已断开或报文过期")
+        let update = self.stop(AutomationState::Fault, "KMBox 监控已断开或报文过期");
+        self.report_at = None;
+        update
     }
 
     fn held_mask(&self) -> Option<u8> {
@@ -853,11 +887,13 @@ impl<D: KmBoxDriver> AutomationController<D> {
         match event["kind"].as_str()? {
             "stream_state" if event["source"] == self.source => {
                 self.stream_live = matches!(event["state"].as_str(), Some("live" | "resumed"));
-                self.video_at = event["frame_at"].as_u64().filter(|timestamp| *timestamp != 0);
                 if !self.stream_live {
+                    let update = self.stop(AutomationState::Fault, "NDI 断流");
+                    self.video_at = None;
                     self.frame = None;
-                    return Some(self.stop(AutomationState::Fault, "NDI 断流"));
+                    return Some(update);
                 }
+                self.video_at = event["frame_at"].as_u64().filter(|timestamp| *timestamp != 0);
             }
             "ndi_health" if self.stream_live && event["source"] == self.source => {
                 if let Some(timestamp) = event["frame_at"].as_u64().filter(|timestamp| *timestamp <= now_ms()) {
@@ -866,15 +902,17 @@ impl<D: KmBoxDriver> AutomationController<D> {
             }
             "stream" if event["source"] == self.source && event.get("error").is_some() => {
                 self.stream_live = false;
+                let update = self.stop(AutomationState::Fault, "NDI 接收故障");
                 self.video_at = None;
                 self.frame = None;
-                return Some(self.stop(AutomationState::Fault, "NDI 接收故障"));
+                return Some(update);
             }
             "model" if event["model"] == self.model => {
                 self.model_ready = event.get("error").is_none() && event["provider"].is_string();
                 if !self.model_ready {
+                    let update = self.stop(AutomationState::Fault, "模型故障");
                     self.frame = None;
-                    return Some(self.stop(AutomationState::Fault, "模型故障"));
+                    return Some(update);
                 }
             }
             "detections" => {
@@ -905,10 +943,11 @@ impl<D: KmBoxDriver> AutomationController<D> {
             }
             "worker_exit" => {
                 self.stream_live = false;
+                let update = self.stop(AutomationState::Fault, "推理进程已退出");
                 self.video_at = None;
                 self.model_ready = false;
                 self.frame = None;
-                return Some(self.stop(AutomationState::Fault, "推理进程已退出"));
+                return Some(update);
             }
             _ => {}
         }
@@ -925,6 +964,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
                "real_control_available":self.real.is_some(),
                "scheduled":self.movement.submitted, "expired":self.movement.expired,
                "queue_ms":self.movement.last_queue_ms,
+               "last_stop":self.last_stop,
                "hold_confirmed":self.confirmed_hold(),
                "event_hold_age_ms":self.report_at.filter(|at| self.event_preview() && at.elapsed() > BUTTON_TIMEOUT)
                    .map(|at| at.elapsed().as_millis() as u64)})

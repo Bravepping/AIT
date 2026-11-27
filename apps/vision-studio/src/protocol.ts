@@ -83,6 +83,11 @@ export type DryRun = {
   queue_ms?: number | null
   hold_confirmed?: boolean
   event_hold_age_ms?: number | null
+  last_stop?: {
+    id: number; at_ms: number; reason: string; previous_state: DryRun['state']; mode: DryRun['mode']
+    video_age_ms: number | null; inference_age_ms: number | null; age_limit_ms: number
+    frame_sequence: number | null; track_id: number | null; button_age_ms: number | null; cleared_pending: boolean
+  } | null
 }
 export type KmBox = {
   kind: 'kmbox'; connected: boolean; monitoring: boolean; buttons: number

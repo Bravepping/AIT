@@ -263,6 +263,42 @@ fn real_tracking_requires_fresh_chord_frames_and_stops_on_release() {
 }
 
 #[test]
+fn stale_326ms_frame_clears_real_queue_and_cannot_rearm() {
+    let mut gate = setup_real();
+    gate.buttons(&physical_input(3, 2));
+    send_frame(&mut gate, 2, &FIRST);
+    send_frame(&mut gate, 3, &FIRST);
+    assert!(gate.movement.has_pending());
+
+    std::thread::sleep(Duration::from_millis(326));
+    let mut stale = fixture_frame(4, &NEXT);
+    stale["frame_at"] = json!(now_ms() - 326);
+    assert!(gate.worker(&stale).is_none());
+    let stopped = gate.tick().unwrap();
+    let stop = &stopped["last_stop"];
+    assert_eq!(stop["mode"], "real");
+    assert_eq!(stop["reason"], "NDI 最新帧超时");
+    assert_eq!(stop["age_limit_ms"], 150);
+    assert_eq!(stop["frame_sequence"], 3);
+    assert!(stop["video_age_ms"].as_u64().unwrap() >= 326);
+    assert_eq!(stop["video_age_ms"].as_u64().unwrap(),
+        stop["at_ms"].as_u64().unwrap() - stop["video_frame_at_ms"].as_u64().unwrap());
+    assert_eq!(stop["cleared_pending"], true);
+    assert!(stopped["candidate"].is_null() && !gate.movement.has_pending());
+
+    let sdk = gate.worker(&json!({"kind":"stream_state","state":"lost","source":1})).unwrap();
+    assert_eq!(&sdk["last_stop"], stop);
+    gate.worker(&json!({"kind":"stream_state","state":"resumed","source":1,"frame_at":now_ms()}));
+    gate.buttons(&physical_input(3, 3));
+    send_frame(&mut gate, 5, &FIRST);
+    gate.tick();
+    assert!(gate.movement.driver.sent.is_empty() && !gate.movement.driver.live);
+    assert!(gate.arm_real(1, false).is_err());
+    gate.buttons(&physical_input(0, 4));
+    assert!(gate.arm_real(1, false).is_ok());
+}
+
+#[test]
 fn real_tracking_faults_clear_candidates_and_require_new_arm() {
     for fault in ["target", "network", "frame", "input", "model", "ack", "stop"] {
         let mut gate = setup_real();

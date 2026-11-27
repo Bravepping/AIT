@@ -1,16 +1,17 @@
 Unicode true
 RequestExecutionLevel user
-Name "NDI Vision Control V1.7 RC"
+Name "NDI Vision Control V1.7 Final 候选"
 OutFile "${SETUP_EXE}"
-InstallDir "$LOCALAPPDATA\Programs\NDI Vision Control\V1.7"
+InstallDir "$LOCALAPPDATA\Programs\NDI Vision Control\V1.7 Final Candidate"
 SetCompressor /SOLID lzma
 
 !include "MUI2.nsh"
 !include "x64.nsh"
 !include "FileFunc.nsh"
 
-!define APP_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\NDIVisionControl-V17"
-!define INSTALL_MARKER "VisionStudio-V1.7-install.marker"
+!define APP_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\NDIVisionControl-V17FinalCandidate"
+!define INSTALL_MARKER "VisionStudio-V1.7-Final-Candidate-install.marker"
+!define SHORTCUT "NDI Vision Control V1.7 Final Candidate.lnk"
 
 Var Smoke
 !insertmacro MUI_PAGE_DIRECTORY
@@ -63,9 +64,9 @@ CopyFiles:
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   ${If} $Smoke == 0
     SetShellVarContext current
-    CreateShortCut "$SMPROGRAMS\NDI Vision Control V1.7 RC.lnk" "$INSTDIR\VisionStudio.exe"
-    WriteRegStr HKCU "${APP_KEY}" "DisplayName" "NDI Vision Control V1.7 RC"
-    WriteRegStr HKCU "${APP_KEY}" "DisplayVersion" "1.7.0-rc.1"
+    CreateShortCut "$SMPROGRAMS\${SHORTCUT}" "$INSTDIR\VisionStudio.exe"
+    WriteRegStr HKCU "${APP_KEY}" "DisplayName" "NDI Vision Control V1.7 Final 候选"
+    WriteRegStr HKCU "${APP_KEY}" "DisplayVersion" "1.7.0-rc.2"
     WriteRegStr HKCU "${APP_KEY}" "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "${APP_KEY}" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
   ${EndIf}
@@ -81,7 +82,7 @@ Section "Uninstall"
     ${If} $0 == $INSTDIR
       DeleteRegKey HKCU "${APP_KEY}"
       SetShellVarContext current
-      Delete "$SMPROGRAMS\NDI Vision Control V1.7 RC.lnk"
+      Delete "$SMPROGRAMS\${SHORTCUT}"
     ${EndIf}
   ${EndIf}
   Delete "$INSTDIR\VisionStudio.exe"

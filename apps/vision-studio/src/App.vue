@@ -132,9 +132,9 @@ function format(value: number | null | undefined, precision = 1) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(precision) : '—'
 }
 
-function addLog(text: string, level = 'info') {
+function addLog(text: string, level = 'info', at = new Date()) {
   if (!text) return
-  logs.value = [...logs.value.slice(-1499), { at: new Date(), text, level }]
+  logs.value = [...logs.value.slice(-1499), { at, text, level }]
 }
 
 function markDeviceAOperation() {
@@ -470,12 +470,12 @@ function importConfiguration(event: Event) {
   }, '已导入配置，真实跟随需要重新武装')
 }
 
-async function setDryRun(enabled: boolean) {
+async function setDryRun(enabled: boolean, emergency = false) {
   if (enabled && configBusy.value) return
   const revision = ++controlsRevision
   dryError.value = ''
   try {
-    if (!enabled) await invoke('stop_gate')
+    if (!enabled) await invoke('stop_gate', { emergency })
     else if (await profileSync && revision === controlsRevision) await invoke('arm_gate')
   } catch (error) {
     dryError.value = asText(error)
@@ -662,8 +662,15 @@ function readEvent(message: WorkerEvent) {
     case 'dry_run': {
       const previous = dryRun.value
       dryRun.value = message
-      if (previous.state !== message.state || previous.profile_id !== message.profile_id) {
-        addLog(`Dry Run · ${stateNames[message.state]} · ${message.reason}` +
+      const stop = message.last_stop
+      if (stop && stop.id !== previous.last_stop?.id) {
+        const mode = stop.mode === 'real' ? '真实跟随' : 'Dry Run'
+        addLog(`${mode} · ${stateNames[message.state]} · ${stop.reason} · 停止前 ${stateNames[stop.previous_state]}` +
+          ` · NDI 帧龄 ${stop.video_age_ms ?? '—'} ms · 推理帧龄 ${stop.inference_age_ms ?? '—'} ms（上限 ${stop.age_limit_ms} ms）` +
+          ` · 帧 ${stop.frame_sequence ?? '—'} · Track ID ${stop.track_id ?? '—'} · 按键报文龄 ${stop.button_age_ms ?? '—'} ms` +
+          ` · ${stop.cleared_pending ? '已清除待发送位移' : '队列为空'}`, message.state === 'Fault' ? 'error' : 'info', new Date(stop.at_ms))
+      } else if (previous.state !== message.state || previous.profile_id !== message.profile_id) {
+        addLog(`${message.mode === 'real' ? '真实跟随' : 'Dry Run'} · ${stateNames[message.state]} · ${message.reason}` +
           (message.profile_name ? ` · ${message.profile_name}` : ''), message.state === 'Fault' ? 'error' : 'info')
       }
       if (message.hold_confirmed && !previous.hold_confirmed) addLog('Dry Run · 设备 A 已确认当前热键处于按下状态')
@@ -713,7 +720,7 @@ watch(preferredPreview, (fps) => { if (previewRate.value) void setPreview(fps) }
 function stopOnF8(event: KeyboardEvent) {
   if (event.key === 'F8') {
     event.preventDefault()
-    void setDryRun(false)
+    if (!event.repeat) void setDryRun(false, true)
   }
 }
 
@@ -726,7 +733,7 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
 
 <template>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.7 RC</small></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>V1.7 Final 候选</small></div>
     <div class="top-actions">
       <div class="process-state"><span class="dot" :class="workerState"></span>
         {{ ready ? '设备 B · 推理进程就绪' : workerState === 'starting' ? '启动推理进程' : '推理进程不可用' }}
@@ -1048,6 +1055,15 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
             <p class="status">{{ fullPassed ? '多方案跟随。可使用完成校准的按住式热键。' : '单目标低速验收。当前方案须为左右组合键并且仅选一个类别。' }}</p>
             <p class="status">真实跟随期间请保持此窗口焦点。按 F8 急停。</p>
             <button class="button danger" type="button" :disabled="!ready || !dryRunPassed || !stepPassed || realArming || dryRun.mode === 'real'" @click="armReal">武装真实跟随</button>
+            <details>
+              <summary>现场停止验收</summary>
+              <ol>
+                <li>在普通桌面测试场景完成单步移动、坐标校准和 Dry Run，再武装单目标低速跟随。</li>
+                <li>分别只按左键和右键，再同时按住两键。分别验证松开左键和松开右键时停止。</li>
+                <li>独立验证 F8、目标移出画面、NDI 断流和 KMBox 断连。每项恢复后确认需要重新武装。</li>
+                <li>导出运行日志，对照停止时间、锁止原因及清队列结果。</li>
+              </ol>
+            </details>
           </div>
           <div class="form-fields">
             <label>水平校准比例<input v-model.number="profile.gainX" type="number" min="0.01" max="10" step="0.01" /></label>
@@ -1084,6 +1100,7 @@ onUnmounted(() => window.removeEventListener('keydown', stopOnF8))
             <button class="button" :disabled="!dryRun.armed" @click="setDryRun(false)">停止</button>
           </div>
           <p class="status" :class="{ fault: dryError || profileError || dryRun.state === 'Fault' }">{{ dryError || profileError || dryRun.reason }}</p>
+          <p v-if="dryRun.last_stop" class="status">上次停止 · {{ new Date(dryRun.last_stop.at_ms).toLocaleTimeString() }} · {{ dryRun.last_stop.reason }}</p>
         </section>
         <section class="card">
           <h2>{{ dryRun.mode === 'real' ? '真实跟随计算结果' : 'Dry Run 计算结果' }}</h2>

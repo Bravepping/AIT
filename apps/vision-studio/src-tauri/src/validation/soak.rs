@@ -59,7 +59,8 @@ pub(super) fn verify() -> Result<(), String> {
         for update in [gate.worker(&event), gate.tick()].into_iter().flatten() {
             if update["state"] == "Fault" && !failed {
                 failed = true;
-                write_line(&mut output, json!({"event":"controller_fault","reason":update["reason"],"rearmed":false}))?;
+                write_line(&mut output, json!({"event":"controller_fault","reason":update["reason"],
+                    "diagnostic":update["last_stop"],"rearmed":false}))?;
             }
         }
         if detection && !initially_armed && !failed && gate.arm().is_ok() {

@@ -1,6 +1,8 @@
-# NDI AI Vision Control V1.7 Release Candidate
+# NDI AI Vision Control V1.7 Final 候选
 
-设备 A 推送 NDI。设备 B 安装 V1.7 RC，或解压便携包后启动 `VisionStudio.exe`。需要 WebView2、NDI Runtime 和 NVIDIA 运行组件。可复用 V1.5 的 `vision-runtime\cuda-libraries` 和 `vision-runtime\trt-packages`，也可以使用随包安装脚本。
+设备 A 推送 NDI。设备 B 安装 V1.7 Final 候选，或解压便携包后启动 `VisionStudio.exe`。安装目录与 V1.7 RC 分开。同一 Windows 用户的本地配置沿用原有存储，升级前可先备份。
+
+首次运行前准备 WebView2 Runtime、NDI Runtime 和适用的 NVIDIA 驱动。TensorRT 运行库可复用此前已验证的 `vision-runtime\cuda-libraries` 和 `vision-runtime\trt-packages`，或者在候选版目录运行 `Install-TensorRT.cmd`。启动后在「推理设置」加载模型，确认实际后端和缓存状态，再连接 NDI。预览和自动发送默认关闭。
 
 ## 配置迁移
 
@@ -23,9 +25,9 @@
 1. 在受控桌面测试场景通过 Dry Run，检查类别、参考点、组合键和松键日志。确认物理按键进入设备 A 后的行为。
 2. 完成单步移动和校准。保存会绑定当前 NDI 源、裁剪尺寸和 KMBox 设备标识。
 3. 使用一个类别、一个目标、左右键组合，在「真实跟随」勾选已完成的两项，再手动武装。松开按钮并刷新按键监控后完成武装，随后重新按下左右键。首档限制在参考点附近 64 NDI 像素，且速度不超过 120 KMBox 单位/秒。
-4. 测试移动目标与跟随后复测任一键松开、目标消失、F8、NDI 断流和 KMBox 断网。完成这些现场项后，才勾选多方案阶段的确认。程序也要求本次运行有单目标低速位移应答。
-5. 导出运行日志。网络应答仅表示盒子确认命令，设备 A 的鼠标位移与实际效果用现场观察验收。
+4. 分别验证单独按左键和右键时不动、两键同时按住时触发、松开任一键时停止。另测目标消失、F8、NDI 断流和 KMBox 断连。每项测试恢复后应保持停止，直到手动重新武装。完成现场项后才勾选多方案阶段的确认。程序也要求本次运行有单目标低速位移应答。
+5. 导出运行日志，核对后端停止时间、原因、NDI 和推理帧龄、队列是否清空。网络应答仅表示盒子确认命令，设备 A 的鼠标位移与实际效果用现场观察验收。
 
 KMBox 固件在静止按住时可能停止上报，真实跟随会在物理状态超过 1200 ms 后锁止。等待下一次候选的 Dry Run 可按上次事件保持。单独校准支持小幅手动发送。真实跟随期间每次最多一条在途命令，当前候选替换待处理的旧命令。
 
-构建使用 `scripts/build-vision-studio-v11.ps1 -PackageName VisionStudio-V1.7-RC -KmCalibration -AutoTracking -NsisCompiler <makensis.exe>`。
+构建使用 `scripts/build-vision-studio-v11.ps1 -PackageName VisionStudio-V1.7-Final-Candidate -KmCalibration -AutoTracking -NsisCompiler <makensis.exe>`。

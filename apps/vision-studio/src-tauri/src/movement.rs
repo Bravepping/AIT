@@ -198,6 +198,8 @@ impl<D: KmBoxDriver> Dispatcher<D> {
         self.last_queue_ms = None;
     }
 
+    pub(crate) fn has_pending(&self) -> bool { self.pending.is_some() }
+
     pub fn reset_stream(&mut self) {
         self.clear();
         self.last = None;

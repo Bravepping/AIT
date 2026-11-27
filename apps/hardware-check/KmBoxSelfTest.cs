@@ -52,7 +52,7 @@ namespace VisionHardwareCheck
                     Require(device.Moves == 1 && !box.MoveCalibrationStep(0, 10), "emergency blocks stationary calibration");
                     Require(box.Resume(), "resume stationary calibration");
                     Wait(() => !box.Current.Halted && !box.Current.Busy, "resume complete");
-                    checks.Add("SIMULATED PASS — explicit calibration works without physical reports, F8 cancels during preflight");
+                    checks.Add("SIMULATED PASS — explicit calibration works without physical reports, manual stop cancels during preflight");
 #endif
                     device.Report(3, 8);
                     Thread.Sleep(100);

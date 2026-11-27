@@ -1,4 +1,4 @@
-use crate::movement::{KmBoxDriver, KmBoxPipe, MoveContext, RelativeMove, Smoothing};
+use crate::movement::{HeldInput, KmBoxDriver, KmBoxPipe, MoveContext, RelativeMove, Smoothing};
 use super::{check, fixture_frame, input, now_ms, AutomationController, Duration, Instant};
 use serde_json::{json, Value};
 
@@ -7,11 +7,15 @@ struct MockKmBox {
     sent: Vec<RelativeMove>,
     disconnected: bool,
     live: bool,
+    takeover_requested: bool,
+    delay_takeover_ack: bool,
+    restore_ready: bool,
 }
 
 impl KmBoxDriver for MockKmBox {
-    fn submit_relative(&mut self, command: RelativeMove, _: MoveContext) -> Result<(), &'static str> {
+    fn submit_relative(&mut self, command: RelativeMove, context: MoveContext) -> Result<(), &'static str> {
         if self.disconnected { return Err("Mock KMBox 发送失败"); }
+        if self.live { assert_eq!(context.held.unwrap().mask, 3); }
         self.sent.push(command);
         Ok(())
     }
@@ -22,7 +26,20 @@ impl KmBoxDriver for MockKmBox {
         Ok(())
     }
 
-    fn stop_live(&mut self) { self.live = false; }
+    fn take_over(&mut self, held: HeldInput) -> Result<(), &'static str> {
+        assert_eq!(held.mask, 3);
+        self.takeover_requested = true;
+        Ok(())
+    }
+
+    fn axes_taken(&self) -> bool { self.live && self.takeover_requested && !self.delay_takeover_ack }
+
+    fn can_arm_live(&self) -> bool { self.restore_ready }
+
+    fn stop_live(&mut self) {
+        self.live = false;
+        self.takeover_requested = false;
+    }
 }
 
 const FIRST: [[f64; 6]; 1] = [[320., 320., 360., 360., 0.8, 1.]];
@@ -273,56 +290,53 @@ fn real_gate(mask: u8, classes: Value) -> AutomationController<MockKmBox> {
 fn setup_real() -> AutomationController<MockKmBox> {
     let mut gate = real_gate(3, json!([1]));
     send_frame(&mut gate, 1, &FIRST);
-    assert!(gate.arm_real(1, false).is_err());
+    assert!(gate.arm_real(1).is_err());
     gate.buttons(&physical_input(0, 1));
-    assert_eq!(gate.arm_real(1, false).unwrap()["mode"], "real");
+    assert_eq!(gate.arm_real(1).unwrap()["mode"], "real");
     assert!(gate.movement.driver.live);
     gate
 }
 
 #[test]
-fn single_hold_and_all_enabled_classes_can_start_directly() {
-    for mask in [1, 2] {
-        verify_single_hold(mask);
+fn real_tracking_requires_the_selected_profile_and_one_class() {
+    for (id, classes) in [(2, json!([1])), (1, Value::Null)] {
+        let mut gate = real_gate(3, classes);
+        send_frame(&mut gate, 1, &FIRST);
+        gate.buttons(&physical_input(0, 1));
+        assert!(gate.arm_real(id).is_err());
     }
-}
-
-#[cfg(test)]
-fn verify_single_hold(mask: u8) {
-    let mut gate = real_gate(mask, Value::Null);
-    send_frame(&mut gate, 1, &[]);
-    gate.buttons(&physical_input(0, 1));
-    assert_eq!(gate.arm_real(1, true).unwrap()["state"], "Armed");
-    gate.buttons(&physical_input(3 ^ mask, 2));
-    send_frame(&mut gate, 2, &FIRST);
-    assert!(gate.target_sample().is_none());
-    gate.buttons(&physical_input(mask, 3));
-    send_frame(&mut gate, 3, &[]);
-    gate.tick();
-    assert!(gate.movement.driver.sent.is_empty());
-    let another_class = [[320., 320., 360., 360., 0.8, 2.]];
-    for sequence in 4..10 {
-        send_frame(&mut gate, sequence, &another_class);
-        gate.tick();
-        std::thread::sleep(Duration::from_millis(18));
-    }
-    assert!(gate.target_sample().is_some());
-    let sent = gate.movement.driver.sent.len();
-    assert!(sent > 0);
-    let released = gate.buttons(&physical_input(0, 4)).unwrap();
-    assert_eq!(released["state"], "Stopped");
-    gate.tick();
-    assert!(gate.target_sample().is_none());
-    assert_eq!(gate.movement.driver.sent.len(), sent);
 }
 
 #[test]
-fn real_tracking_requires_fresh_chord_frames_and_stops_on_release() {
+fn real_tracking_waits_for_mask_ack_and_releases_before_late_ack() {
     let mut gate = setup_real();
-    gate.buttons(&physical_input(1, 2));
+    gate.movement.driver.delay_takeover_ack = true;
+    assert!(!gate.movement.driver.takeover_requested);
+    gate.buttons(&physical_input(3, 2));
+    assert!(gate.movement.driver.takeover_requested);
+    send_frame(&mut gate, 2, &FIRST);
+    send_frame(&mut gate, 3, &FIRST);
+    assert!(gate.target_sample().is_some());
+    assert!(!gate.movement.has_pending());
+    gate.tick();
+    assert!(gate.movement.driver.sent.is_empty());
+    gate.buttons(&physical_input(0, 3));
+    gate.movement.driver.delay_takeover_ack = false;
+    send_frame(&mut gate, 4, &FIRST);
+    gate.tick();
+    assert!(!gate.movement.driver.takeover_requested);
+    assert!(gate.movement.driver.sent.is_empty());
+}
+
+#[test]
+fn real_tracking_requires_both_keys_and_fresh_frames() {
+    let mut gate = setup_real();
+    gate.buttons(&physical_input(2, 2));
     send_frame(&mut gate, 2, &FIRST);
     assert!(gate.target_sample().is_none());
-    gate.buttons(&physical_input(3, 3));
+    gate.buttons(&physical_input(1, 3));
+    assert!(!gate.movement.driver.takeover_requested);
+    gate.buttons(&physical_input(3, 4));
     assert!(gate.target_sample().is_none());
     send_frame(&mut gate, 3, &FIRST);
     assert!(gate.target_sample().is_none());
@@ -337,12 +351,47 @@ fn real_tracking_requires_fresh_chord_frames_and_stops_on_release() {
     gate.tick();
     assert_eq!(gate.movement.driver.sent.len(), sent);
     send_frame(&mut gate, 10, &FIRST);
-    let released = gate.buttons(&physical_input(2, 4)).unwrap();
+    assert!(gate.movement.driver.live);
+    let released = gate.buttons(&physical_input(2, 5)).unwrap();
     assert_eq!(released["state"], "Stopped");
-    gate.buttons(&physical_input(3, 5));
+    gate.buttons(&physical_input(3, 6));
     gate.tick();
     assert!(!gate.movement.driver.live);
     assert_eq!(gate.movement.driver.sent.len(), sent);
+}
+
+#[test]
+fn waiting_for_chord_tolerates_idle_silence_without_sending() {
+    let mut gate = setup_real();
+    gate.buttons(&input(0, 1201));
+    assert_eq!(gate.snapshot()["state"], "Armed");
+    assert!(!gate.movement.driver.takeover_requested);
+    gate.buttons(&physical_input(3, 2));
+    assert!(gate.movement.driver.takeover_requested);
+}
+
+#[test]
+fn clean_release_waits_for_restore_ack_and_all_buttons_up_before_rearming() {
+    let mut gate = setup_real();
+    gate.buttons(&physical_input(3, 2));
+    send_frame(&mut gate, 2, &FIRST);
+    send_frame(&mut gate, 3, &FIRST);
+    assert!(gate.movement.has_pending());
+    gate.buttons(&physical_input(1, 3));
+    assert!(!gate.movement.has_pending() && !gate.movement.driver.live);
+    assert!(gate.tick().is_none());
+    gate.buttons(&physical_input(3, 4));
+    gate.movement.driver.restore_ready = true;
+    assert!(gate.tick().is_none());
+    gate.buttons(&physical_input(0, 5));
+    assert_eq!(gate.tick().unwrap()["state"], "Armed");
+    assert!(!gate.movement.driver.takeover_requested);
+    gate.buttons(&physical_input(3, 6));
+    assert!(gate.movement.driver.takeover_requested);
+    gate.buttons(&physical_input(0, 7));
+    gate.stop_manual();
+    gate.tick();
+    assert!(!gate.movement.driver.live);
 }
 
 #[test]
@@ -376,14 +425,14 @@ fn stale_326ms_frame_clears_real_queue_and_cannot_rearm() {
     send_frame(&mut gate, 5, &FIRST);
     gate.tick();
     assert!(gate.movement.driver.sent.is_empty() && !gate.movement.driver.live);
-    assert!(gate.arm_real(1, false).is_err());
+    assert!(gate.arm_real(1).is_err());
     gate.buttons(&physical_input(0, 4));
-    assert!(gate.arm_real(1, false).is_ok());
+    assert!(gate.arm_real(1).is_ok());
 }
 
 #[test]
 fn real_tracking_faults_clear_candidates_and_require_new_arm() {
-    for fault in ["target", "network", "frame", "input", "model", "ack", "stop", "f8", "release_left", "release_right"] {
+    for fault in ["target", "network", "frame", "input", "model", "ack", "stop", "release_left", "release_right"] {
         let mut gate = setup_real();
         gate.buttons(&physical_input(3, 2));
         send_frame(&mut gate, 2, &FIRST);
@@ -396,17 +445,18 @@ fn real_tracking_faults_clear_candidates_and_require_new_arm() {
             "input" => gate.buttons(&input(3, 1201)).unwrap(),
             "model" => gate.worker(&json!({"kind":"model","model":1,"error":"fault"})).unwrap(),
             "ack" => gate.live_fault("KMBox 命令应答超时").unwrap(),
-            "stop" => gate.stop_manual(false),
-            "f8" => gate.stop_manual(true),
+            "stop" => gate.stop_manual(),
             "release_left" => gate.buttons(&physical_input(2, 3)).unwrap(),
             "release_right" => gate.buttons(&physical_input(1, 3)).unwrap(),
             _ => unreachable!(),
         };
         assert!(update["candidate"].is_null() && update["armed"] == false, "{fault}");
         assert!(update["last_stop"]["cleared_pending"] == true, "{fault}");
-        if fault == "f8" { assert_eq!(update["last_stop"]["reason"], "F8 紧急停止，请重新武装"); }
+        if fault == "stop" { assert_eq!(update["last_stop"]["reason"], "已停止跟随，请按需重新启用"); }
         assert!(!gate.movement.driver.live, "{fault}");
+        if !fault.starts_with("release_") { gate.movement.driver.restore_ready = true; }
         gate.buttons(&physical_input(3, 4));
+        gate.buttons(&physical_input(0, 5));
         gate.tick();
         assert!(gate.target_sample().is_none() && gate.movement.driver.sent.is_empty(), "{fault}");
     }

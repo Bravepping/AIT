@@ -1,6 +1,6 @@
 [package]
 name = "vision-studio"
-version = "1.7.0-rc.3"
+version = "1.8.0-rc.5"
 description = "NDI Vision Control desktop client"
 edition = "2021"
 

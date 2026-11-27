@@ -1,6 +1,6 @@
 {
   "name": "ndi-vision-studio",
-  "version": "1.7.0-rc.3",
+  "version": "1.8.0-rc.5",
   "private": true,
   "type": "module",
   "scripts": {

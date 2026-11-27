@@ -22,7 +22,6 @@ if (!Array.isArray(profiles.value) || !profiles.value.length) profiles.value = [
 profiles.value = profiles.value.map(migrateProfile)
 const selection = ref(saved('vision-v17-selection', profiles.value[0]!.id))
 const profile = computed(() => profiles.value.find((entry) => entry.id === selection.value) ?? profiles.value[0]!)
-const profileKeys = computed(() => pointerKeys.filter((_, index) => profile.value.mask & (1 << index)).join(' + '))
 const enabledClasses = ref(saved('vision-v11-enabled-classes', [...classIds]))
 const preferencesKey = 'vision-v13-settings'
 const preferences = saved<Preferences>(preferencesKey, {
@@ -41,6 +40,7 @@ const configStatus = ref('')
 const configFailed = ref(false)
 const inputPairing = ref('')
 const kmBox = shallowRef<KmBox | null>(null)
+const xyRecoveryPending = ref(false)
 const dryRun = shallowRef<DryRun>({ kind: 'dry_run', state: 'Idle', armed: false, active: false,
   reason: '等待实时状态', candidate: null, mode: 'dry_run', real_control_available: false })
 const dryError = ref('')
@@ -53,7 +53,6 @@ const startOnOpen = ref(saved('vision-start-on-open', false))
 const startingWork = ref(false)
 const startupIssues = ref<string[]>([])
 const startupSource = ref('')
-const useAllHoldProfiles = ref(false)
 const realArming = ref(false)
 const waitingForRelease = ref(false)
 const calibrationStatus = ref('')
@@ -124,10 +123,23 @@ let profileSync: Promise<boolean> = Promise.resolve(true)
 const ready = computed(() => workerState.value === 'ready')
 const workReady = computed(() => streamState.value === 'live' && !!activeEngine.value &&
   !!kmBox.value?.connected && kmBox.value.monitoring && !kmBox.value.halted)
+const xyStatus = computed(() => {
+  switch (kmBox.value?.xy_status) {
+    case 'masking': return '正在等待屏蔽 X/Y 的应答'
+    case 'masked': return '物理 X/Y 已屏蔽 · KMBox 已应答'
+    case 'restoring': return '正在等待解除 X/Y 屏蔽的应答'
+    case 'restored': return '物理 X/Y 屏蔽已解除 · KMBox 已应答'
+    default: return xyRecoveryPending.value ? '物理 X/Y 恢复待确认 · 请重连原 KMBox' : ''
+  }
+})
 const realStartBlocked = computed(() => {
-  const items = useAllHoldProfiles.value ? profiles.value : [profile.value]
-  if (!items.some((item) => item.enabled && item.mask !== 0 && item.mode === 'hold'))
-    return '请在热键管理中启用一个已设定按键的「按住执行」方案。'
+  const item = profile.value
+  if (!item.enabled || item.mask === 0 || item.mode !== 'hold')
+    return '请在热键管理中选择一个已启用的「按住执行」方案。'
+  const allowed = enabledClasses.value.filter((id) =>
+    item.scope === 'all' || (item.scope === 'single' ? id === item.single : item.classes.includes(id)))
+  if (new Set(allowed).size !== 1) return '首轮测试需要在目标识别中为当前方案选择一个类别。'
+  if (kmBox.value?.xy_status === 'restoring') return '请等待 KMBox 确认解除物理 X/Y 屏蔽。'
   return ''
 })
 const selectedSource = computed(() =>
@@ -482,7 +494,8 @@ function profilePayload(entries: Profile[], classes: number[]) {
     dead_zone_axes: entry.deadZoneAxes, max_speed: entry.maxSpeed, acceleration: entry.acceleration,
     tracking_gain: entry.trackingGain,
     motion: { algorithm: entry.motion.algorithm, derivative_ms: entry.motion.derivativeMs,
-      prediction_ms: entry.motion.predictionMs, slow_radius_px: entry.motion.slowRadiusPx, adaptive: entry.motion.adaptive },
+      prediction_ms: entry.motion.predictionMs, slow_radius_px: entry.motion.slowRadiusPx, adaptive: entry.motion.adaptive,
+      acquisition_gain: entry.motion.acquisitionGain, transition_px: entry.motion.transitionPx },
     reference_x: entry.referenceX, reference_y: entry.referenceY,
     calibration_site: entry.calibration?.desktop && entry.calibration.crop
       ? { source: entry.calibration.source, device: entry.calibration.device,
@@ -583,13 +596,13 @@ function importConfiguration(event: Event) {
   }, '已导入配置，真实跟随需要重新武装')
 }
 
-async function setDryRun(enabled: boolean, emergency = false) {
+async function setDryRun(enabled: boolean) {
   if (enabled && (configBusy.value || startingWork.value)) return
   if (!enabled) pendingRealStart?.abort()
   const revision = ++controlsRevision
   dryError.value = ''
   try {
-    if (!enabled) await invoke('stop_gate', { emergency })
+    if (!enabled) await invoke('stop_gate')
     else if (await profileSync && revision === controlsRevision) await invoke('arm_gate')
   } catch (error) {
     dryError.value = asText(error)
@@ -603,7 +616,6 @@ async function armReal() {
   const revision = ++controlsRevision
   const request = new AbortController()
   const profileId = profile.value.id
-  const allProfiles = useAllHoldProfiles.value
   pendingRealStart = request
   dryError.value = ''
   try {
@@ -629,7 +641,7 @@ async function armReal() {
       10000, '没有收到新鲜的松键报文。请松开按键，可轻动设备 A 的鼠标，再点开始。', request.signal)
     waitingForRelease.value = false
     if (!request.signal.aborted && revision === controlsRevision) {
-      await invoke('arm_real_tracking', { profileId, allProfiles })
+      await invoke('arm_real_tracking', { profileId })
     }
   } catch (error) {
     if (!request.signal.aborted) {
@@ -786,6 +798,8 @@ function readEvent(message: WorkerEvent) {
       break
     case 'kmbox':
       kmBox.value = message
+      if (message.xy_status === 'restored') xyRecoveryPending.value = false
+      if (message.xy_status === 'recovery_pending') xyRecoveryPending.value = true
       break
     case 'rate_dip': {
       const phase = message.duration_ms === null ? '下降' : `恢复 · 持续约 ${format(message.duration_ms / 1000, 2)} s`
@@ -802,7 +816,8 @@ function readEvent(message: WorkerEvent) {
       break
     case 'kmbox_exit':
       kmBox.value = null
-      boxError.value = 'KMBox 监控进程已退出'
+      xyRecoveryPending.value ||= message.recovery_pending === true
+      boxError.value = xyRecoveryPending.value ? 'KMBox 监控进程已退出，物理 X/Y 恢复待确认' : 'KMBox 监控进程已退出'
       addLog(boxError.value, 'error')
       break
     case 'move_receipt':
@@ -837,9 +852,11 @@ function readEvent(message: WorkerEvent) {
       if (message.event_hold_age_ms != null && previous.event_hold_age_ms == null) addLog('Dry Run · 按上次按键事件保持候选，等待松键报文')
       if (message.candidate && (performance.now() >= nextCandidateLog || !previous.candidate ||
           previous.profile_id !== message.profile_id || previous.candidate.lock_id !== message.candidate.lock_id ||
-          previous.candidate.track_id !== message.candidate.track_id)) {
+          previous.candidate.track_id !== message.candidate.track_id ||
+          previous.candidate.control_phase !== message.candidate.control_phase)) {
         const item = message.candidate
-        addLog(`${message.mode === 'real' ? '真实跟随' : 'Dry Run'} · ${message.profile_name} (#${item.profile_id}) · 帧 ${item.sequence} · Track ID ${item.track_id} · 类别 ${item.class} · 置信度 ${format(item.score * 100)}% · ${item.selection_reason} · 锁定点 (${item.anchor.map((v) => format(v)).join(', ')}) · 换算比例 X/Y ${item.signed_scale.map(v => format(v, 6)).join(' / ')} · dx/dy (${item.relative.join(', ')}) · 选取 ${format(item.selection_ms, 3)} / 位移 ${format(item.movement_ms, 3)} ms · 收帧到候选 ${item.latency_ms} ms${keys}${ages}`,
+        const phase = item.control_phase === 'acquisition' ? '快速吸附' : item.control_phase === 'tracking' ? '平滑跟随' : 'Dry Run'
+        addLog(`${phase} · ${message.profile_name} (#${item.profile_id}) · 帧 ${item.sequence} · Track ID ${item.track_id} · 类别 ${item.class} · 置信度 ${format(item.score * 100)}% · ${item.selection_reason} · 锁定点 (${item.anchor.map((v) => format(v)).join(', ')}) · 参考点 (${item.reference.map((v) => format(v)).join(', ')}) · 偏差 (${item.offset.map((v) => format(v)).join(', ')}) · 换算比例 X/Y ${item.signed_scale.map(v => format(v, 6)).join(' / ')} · 限速前 dx/dy (${item.relative.join(', ')}) · 选取 ${format(item.selection_ms, 3)} / 位移 ${format(item.movement_ms, 3)} ms · 收帧到候选 ${item.latency_ms} ms${keys}${ages}`,
           'info', observation ? new Date(observation.at_ms) : undefined)
         nextCandidateLog = performance.now() + 1000
       }
@@ -885,35 +902,18 @@ watch([boxAddress, boxPort, boxUuid, monitorPort, requestedEngine, selectedModel
 })
 watch(preferredPreview, (fps) => { if (previewRate.value) void setPreview(fps) })
 
-function stopOnF8(event: KeyboardEvent) {
-  if (event.key === 'F8') {
-    event.preventDefault()
-    if (!event.repeat) void setDryRun(false, true)
-  }
-}
-
-function cancelPendingRealStart() { pendingRealStart?.abort() }
-
-onMounted(() => {
-  window.addEventListener('keydown', stopOnF8)
-  window.addEventListener('blur', cancelPendingRealStart)
-  void launch()
-})
-onUnmounted(() => {
-  cancelPendingRealStart()
-  window.removeEventListener('keydown', stopOnF8)
-  window.removeEventListener('blur', cancelPendingRealStart)
-})
+onMounted(() => { void launch() })
+onUnmounted(() => { pendingRealStart?.abort() })
 </script>
 
 <template>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>{{ holdDiagnostics ? 'V1.7 KMBox 长按专项' : 'V1.7 跟随状态更新' }}</small></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>NDI Vision Control <small>{{ holdDiagnostics ? 'KMBox 长按专项' : 'V1.8 双阶段实机测试' }}</small></div>
     <div class="top-actions">
       <div class="process-state"><span class="dot" :class="workerState"></span>
         {{ workReady ? '设备 B · 视频与监控就绪' : ready ? '设备 B · 等待开始工作' : workerState === 'starting' ? '启动推理进程' : '推理进程不可用' }}
       </div>
-      <button class="button danger" type="button" @click="setDryRun(false)">停止跟随 · F8</button>
+      <button class="button danger" type="button" @click="setDryRun(false)">停止跟随</button>
     </div>
   </header>
 
@@ -994,13 +994,14 @@ onUnmounted(() => {
             <h2>{{ holdDiagnostics ? '只读测试' : dryRun.mode === 'real' ? '真实跟随已开启' : '真实跟随未开启' }}</h2>
             <p v-if="dryRun.mode !== 'real' && dryRun.armed" class="status">当前在只读测试中，候选位移不会移动鼠标。</p>
             <p class="status" :class="{ fault: dryRun.state === 'Fault' }">{{ stateNames[dryRun.state] }} · {{ dryRun.reason }}</p>
+            <p v-if="xyStatus" class="status" :class="{ fault: xyRecoveryPending }" role="status">{{ xyStatus }}</p>
             <div class="readout">{{ candidate ? candidate.relative.join(' , ') : '—' }}</div>
             <p class="status">{{ dryRun.profile_name || '等待启用方案的热键' }} · {{ dryRun.mode === 'real' ? '计算位移' : '只读候选位移' }} dx / dy</p>
             <p v-if="dryRun.hold_confirmed" class="status">设备 A 持键确认有效</p>
             <p v-if="dryRun.event_hold_age_ms != null" class="status">按上次事件保持 · 距按键报文 {{ (dryRun.event_hold_age_ms / 1000).toFixed(1) }} 秒</p>
             <div class="button-group">
-              <button class="button" type="button" :disabled="!workReady || startingWork || dryRun.armed" @click="setDryRun(true)">只计算位移</button>
-              <button class="button" type="button" :disabled="!dryRun.armed" @click="setDryRun(false)">停止</button>
+              <button class="button" type="button" :disabled="!workReady || startingWork || dryRun.armed || dryRun.mode === 'real'" @click="setDryRun(true)">只计算位移</button>
+              <button class="button" type="button" :disabled="!dryRun.armed && dryRun.mode !== 'real'" @click="setDryRun(false)">停止</button>
             </div>
             <p v-if="dryError || profileError" class="status fault" role="alert">{{ dryError || profileError }}</p>
           </section>
@@ -1064,6 +1065,7 @@ onUnmounted(() => {
               @click="monitor({ cmd: 'trace_wire' })">{{ kmBox?.wire_trace_active ? '正在记录 UDP 报文' : '记录 30 秒 UDP 报文' }}</button>
           </div>
           <p class="status">{{ kmBox?.connection ?? '未连接' }} · {{ kmBox?.monitor ?? '监控已关闭' }} · 有效报文 {{ kmBox?.reports ?? 0 }}</p>
+          <p v-if="xyStatus" class="status" :class="{ fault: xyRecoveryPending }" role="status">{{ xyStatus }}</p>
           <dl class="state-list">
             <div><dt>最近物理报文</dt><dd>{{ kmBox && kmBox.age_ms >= 0 ? `${kmBox.age_ms} ms 前` : '—' }}</dd></div>
             <div><dt>本次监控心跳应答</dt><dd>{{ kmBox?.heartbeat_acks ?? 0 }}</dd></div>
@@ -1172,7 +1174,7 @@ onUnmounted(() => {
           </label>
           <p v-if="(profile.mask & 3) === 3" class="status">左键和右键须同时按住，松开任一键即结束触发。</p>
           <label v-if="!holdDiagnostics && profile.mode === 'hold'" class="key-chip"><input v-model="profile.eventPreview" type="checkbox" />Dry Run 按事件保持候选</label>
-          <p v-if="!holdDiagnostics && profile.mode === 'hold' && profile.eventPreview" class="status">启动后条件就绪即等待热键，松键后继续等待下一次按下。若松键报文丢失，按 F8 停止。</p>
+          <p v-if="!holdDiagnostics && profile.mode === 'hold' && profile.eventPreview" class="status">启动后条件就绪即等待热键，松键后继续等待下一次按下。若松键报文丢失，点击「停止跟随」。</p>
         </section>
       </div>
 
@@ -1219,8 +1221,8 @@ onUnmounted(() => {
             <label>Dry Run 遮挡等待（ms）<input v-model.number="profile.lostWaitMs" type="number" min="0" max="500" /></label>
             <label>锁定点水平偏移 (%)<input v-model.number="profile.anchorX" type="number" min="-50" max="50" /></label>
             <label>锁定点垂直偏移 (%)<input v-model.number="profile.anchorY" type="number" min="-50" max="50" /></label>
-            <label>参考点 X (%)<input v-model.number="profile.referenceX" type="number" min="0" max="100" /></label>
-            <label>参考点 Y (%)<input v-model.number="profile.referenceY" type="number" min="0" max="100" /></label>
+            <label>原始 NDI 准星 X (%)<input v-model.number="profile.referenceX" type="number" min="0" max="100" /></label>
+            <label>原始 NDI 准星 Y (%)<input v-model.number="profile.referenceY" type="number" min="0" max="100" /></label>
           </div>
           <p class="status">偏移按检测框大小换算。有效半径 100% 等于画面短边的一半。置信度最低 55% 为当前检测后端的输出阈值。</p>
           <details>
@@ -1258,12 +1260,12 @@ onUnmounted(() => {
           </label>
           <p v-if="controlMode === 'dry_run'" class="status">此模式只计算候选位移。</p>
           <div v-if="controlMode === 'real'" class="real-start-panel">
-            <h3>{{ useAllHoldProfiles ? '全部已启用的按住方案' : `当前热键方案 · ${profile.name}` }}</h3>
-            <p v-if="!useAllHoldProfiles && profileKeys && profile.mode === 'hold'" class="status">按住 {{ profileKeys }} 触发</p>
-            <label class="key-chip"><input v-model="useAllHoldProfiles" type="checkbox" :disabled="realArming || dryRun.mode === 'real'" />使用全部已启用的按住方案</label>
+            <h3>当前方案 · {{ profile.name }}</h3>
+            <p class="status">按住左右键触发，松开任意一键停止。首轮上限 120 单位/秒，起始半径最多 64 NDI 像素。</p>
             <p v-if="realStartBlocked" id="real-start-blocked" class="status fault">{{ realStartBlocked }}</p>
             <p v-else-if="waitingForRelease" class="status" role="status">正在等新鲜的松键报文。请松开设备 A 的鼠标按键，必要时轻动一下鼠标。</p>
-            <p v-else class="status" role="status">{{ dryRun.mode === 'real' ? dryRun.reason : '开始后，看到等待热键再按下。请保持设备 B 主窗口焦点，F8 可急停。' }}</p>
+            <p v-else class="status" role="status">{{ dryRun.mode === 'real' ? dryRun.reason : '开始后，看到等待组合键的提示再按下。' }}</p>
+            <p v-if="xyStatus" class="status" :class="{ fault: xyRecoveryPending }" role="status">{{ xyStatus }}</p>
             <p v-if="reusableCalibration && dryRun.mode !== 'real'" class="status">若设备 A 的桌面仍为 {{ reusableCalibration.desktop?.join(' × ') }}，可直接使用之前的校准。</p>
             <div class="button-group">
               <button class="button primary" type="button" :disabled="!ready || !!realStartBlocked || startingWork || realArming || dryRun.mode === 'real'"
@@ -1272,7 +1274,7 @@ onUnmounted(() => {
               </button>
               <button v-if="realArming" class="button" type="button" @click="setDryRun(false)">取消启动</button>
               <button v-if="reusableCalibration && !realArming && dryRun.mode !== 'real'" class="button" type="button" @click="reuseCalibration">沿用已保存的校准</button>
-              <button v-if="!realArming && dryRun.mode !== 'real'" class="button" type="button" @click="page = '热键管理'">设置热键</button>
+              <button v-if="!realArming && dryRun.mode !== 'real'" class="button" type="button" @click="page = '热键管理'">选择方案</button>
             </div>
           </div>
           <details class="advanced-motion">
@@ -1282,7 +1284,9 @@ onUnmounted(() => {
             <label>垂直校准比例<input v-model.number="profile.gainY" type="number" min="0.01" max="10" step="0.01" /></label>
             <label>真实跟随 X 增益<input v-model.number="profile.trackingGain[0]" type="number" min="0.01" max="2" step="0.01" /></label>
             <label>真实跟随 Y 增益<input v-model.number="profile.trackingGain[1]" type="number" min="0.01" max="2" step="0.01" /></label>
-            <label>移动算法<select v-model="profile.motion.algorithm"><option value="p">P</option><option value="pd">PD</option></select></label>
+            <label>快速吸附增益<input v-model.number="profile.motion.acquisitionGain" type="number" min="1" max="8" step="0.1" /></label>
+            <label>吸附转跟随距离（NDI 像素）<input v-model.number="profile.motion.transitionPx" type="number" min="1" max="160" step="0.1" /></label>
+            <label>平滑跟随算法<select v-model="profile.motion.algorithm"><option value="pd">PD</option><option value="p">P</option></select></label>
             <template v-if="profile.motion.algorithm === 'pd'">
               <label>X 微分时间（ms）<input v-model.number="profile.motion.derivativeMs[0]" type="number" min="0" max="120" /></label>
               <label>Y 微分时间（ms）<input v-model.number="profile.motion.derivativeMs[1]" type="number" min="0" max="120" /></label>
@@ -1306,12 +1310,12 @@ onUnmounted(() => {
             <label class="key-chip"><input v-model="profile.invertX" type="checkbox" />反转水平轴</label>
             <label class="key-chip"><input v-model="profile.invertY" type="checkbox" />反转垂直轴</label>
           </div>
-          <p class="status">参考点按 NDI 画面百分比配置。半衰期填 0 可关闭平滑。</p>
+          <p class="status">在「目标识别」中按设备 A 的原始 NDI 帧设置准星。居中时 X、Y 都填 50%。</p>
           </details>
           <div class="button-group">
             <button v-if="controlMode === 'dry_run' && !holdDiagnostics" class="button primary" :disabled="!ready || startingWork || configBusy" @click="startRealFromOverview">开始真实跟随</button>
-            <button v-if="controlMode === 'dry_run'" class="button" :disabled="!ready || dryRun.armed" @click="setDryRun(true)">只计算位移</button>
-            <button class="button" :disabled="!dryRun.armed" @click="setDryRun(false)">停止</button>
+            <button v-if="controlMode === 'dry_run'" class="button" :disabled="!ready || dryRun.armed || dryRun.mode === 'real'" @click="setDryRun(true)">只计算位移</button>
+            <button class="button" :disabled="!dryRun.armed && dryRun.mode !== 'real'" @click="setDryRun(false)">停止</button>
           </div>
           <p class="status" :class="{ fault: dryError || profileError || dryRun.state === 'Fault' }">{{ dryError || profileError || dryRun.reason }}</p>
           <p v-if="dryRun.last_stop" class="status">上次停止 · {{ new Date(dryRun.last_stop.at_ms).toLocaleTimeString() }} · {{ dryRun.last_stop.reason }}</p>
@@ -1327,6 +1331,7 @@ onUnmounted(() => {
           <div class="readout">{{ candidate ? candidate.relative.join(' , ') : '—' }} <small>dx / dy</small></div>
           <dl class="state-list">
             <div><dt>触发方案</dt><dd>{{ dryRun.profile_name ?? '—' }}</dd></div>
+            <div v-if="dryRun.mode === 'real'"><dt>控制阶段</dt><dd>{{ candidate?.control_phase === 'acquisition' ? '快速吸附' : candidate?.control_phase === 'tracking' ? '平滑跟随' : '—' }}</dd></div>
             <div><dt>检测类别</dt><dd>{{ candidate ? `${candidate.class} · ${format(candidate.score * 100)}%` : '—' }}</dd></div>
             <div><dt>选择原因</dt><dd>{{ candidate?.selection_reason ?? '—' }}</dd></div>
             <div><dt>锁定编号</dt><dd>{{ candidate?.lock_id ?? '—' }}</dd></div>
@@ -1347,7 +1352,7 @@ onUnmounted(() => {
         </section>
         <section class="card">
           <h2>应用手动校准测量</h2>
-          <p class="status">在设备 A 的普通桌面完成 +10 水平与 +10 垂直单次测试。验收窗口提供五键状态和 F8 急停。</p>
+          <p class="status">在设备 A 的普通桌面完成 +10 水平与 +10 垂直单次测试。验收窗口提供五键状态和「紧急停止」按钮。</p>
           <button v-if="controlMode === 'calibration'" class="button" type="button" @click="openKmBoxAcceptance">打开单步校准</button>
           <p v-if="boxError" class="status fault" role="alert">{{ boxError }}</p>
           <p class="status">测量时使用 NDI 图像坐标，完成后填写有符号位移。</p>

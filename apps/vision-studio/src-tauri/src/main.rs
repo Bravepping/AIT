@@ -76,7 +76,7 @@ struct MonitorWorker {
 impl Drop for MonitorWorker {
     fn drop(&mut self) {
         let _ = self.writer.message(&json!({"cmd":"exit"}));
-        let deadline = Instant::now() + Duration::from_millis(850);
+        let deadline = Instant::now() + Duration::from_millis(2500);
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() { return; }
             thread::sleep(Duration::from_millis(25));
@@ -376,10 +376,23 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
                 }
                 if event["kind"] == "kmbox" {
                     if let Ok(mut gate) = safety.gate.lock() {
+                        if generation.load(Ordering::SeqCst) != current { return; }
+                        gate.movement.driver.observe_axes(event["xy_status"].as_str(), event["busy"] == true);
                         if let Some(update) = gate.buttons(&event) {
                             safety.event(update);
                         }
                     }
+                }
+                if event["kind"] == "auto_takeover_status" {
+                    if let Ok(mut gate) = safety.gate.lock() {
+                        if generation.load(Ordering::SeqCst) != current { return; }
+                        let id = event["id"].as_u64().unwrap_or_default();
+                        let result = gate.movement.driver.takeover_result(id, event["status"] == "acknowledged");
+                        if result == Some(false) {
+                            if let Some(update) = gate.live_fault("KMBox 未确认接管，请重新武装") { safety.event(update); }
+                        }
+                    }
+                    continue;
                 }
                 if event["kind"] == "move_status" {
                     if let Ok(mut gate) = safety.gate.lock() {
@@ -405,13 +418,14 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
                 }
                 safety.event(event);
             }
-            if generation.load(Ordering::SeqCst) == current {
-                safety.update(|gate| {
+            if let Ok(mut gate) = safety.gate.lock() {
+                if generation.load(Ordering::SeqCst) == current {
+                    let recovery_pending = gate.movement.driver.axes_need_recovery();
                     gate.movement.driver.detach();
-                    gate.monitor_failed()
-                });
-                safety.event(json!({"kind": "kmbox_exit"}));
-            }
+                    safety.event(gate.monitor_failed());
+                    safety.event(json!({"kind":"kmbox_exit", "recovery_pending":recovery_pending}));
+                }
+            };
         });
     }
     let worker = slot.as_mut().ok_or("监控进程尚未启动")?;
@@ -427,12 +441,16 @@ fn open_kmbox_acceptance(state: State<MonitorState>, dry_run: State<DryRunState>
     if !path.is_file() { return Err("当前目录缺少 VisionKmCalibration.exe，请完整解压现场验收包".into()); }
     let mut session = state.0.lock().map_err(|error| error.to_string())?;
     if session.acceptance_running()? { return Err("实体鼠标验收窗口已打开".into()); }
-    session.generation.fetch_add(1, Ordering::SeqCst);
-    dry_run.update(|gate| {
+    {
+        let mut gate = dry_run.gate.lock().map_err(|error| error.to_string())?;
+        if gate.movement.driver.axes_need_recovery() {
+            return Err("请先停止真实跟随并确认物理 X/Y 恢复，再打开校准工具".into());
+        }
+        session.generation.fetch_add(1, Ordering::SeqCst);
         gate.monitor_changed();
         gate.movement.driver.detach();
-        gate.disarm("实体鼠标验收期间，Dry Run 停止")
-    });
+        dry_run.event(gate.disarm("实体鼠标验收期间，Dry Run 停止"));
+    }
     drop(session.monitor.take());
     session.acceptance = Some(Command::new(&path).current_dir(root).spawn()
         .map_err(|error| format!("实体鼠标验收窗口启动失败，{error}"))?);
@@ -468,19 +486,16 @@ fn arm_gate(state: State<DryRunState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn arm_real_tracking(app: AppHandle, state: State<DryRunState>, profile_id: u32, all_profiles: bool) -> Result<(), String> {
+fn arm_real_tracking(state: State<DryRunState>, profile_id: u32) -> Result<(), String> {
     if cfg!(feature = "kmbox-hold-diagnostics") { return Err("KMBox 长按专项包的真实自动发送已锁定".into()); }
-    if !app.get_webview_window("main").is_some_and(|window| window.is_focused().unwrap_or(false)) {
-        return Err("请让主窗口保持焦点，以便使用 F8 急停".into());
-    }
     let mut gate = state.gate.lock().map_err(|error| error.to_string())?;
-    state.event(gate.arm_real(profile_id, all_profiles)?);
+    state.event(gate.arm_real(profile_id)?);
     Ok(())
 }
 
 #[tauri::command]
-fn stop_gate(state: State<DryRunState>, emergency: Option<bool>) {
-    state.update(|gate| gate.stop_manual(emergency.unwrap_or(false)));
+fn stop_gate(state: State<DryRunState>) {
+    state.update(AutomationController::stop_manual);
 }
 
 #[tauri::command]
@@ -603,16 +618,6 @@ fn main() {
         .manage(MonitorState::default())
         .manage(dry_run)
         .manage(StartupCheck(startup))
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Focused(false)) {
-                let state = window.state::<DryRunState>();
-                if let Ok(mut gate) = state.gate.lock() {
-                    if let Some(update) = gate.live_fault("主窗口已失焦，真实跟随已停止") {
-                        state.event(update);
-                    }
-                };
-            }
-        })
         .setup(|app| {
             if let Some(path) = app.state::<StartupCheck>().0.as_ref() {
                 let _ = fs::write(path.with_extension("phase"), "WEBVIEW_INITIALIZED");
@@ -627,11 +632,11 @@ fn main() {
     app.run(|app, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
             app.state::<DryRunState>().update(|gate| gate.disarm("程序退出"));
-            if let Ok(mut slot) = app.state::<WorkerState>().0.lock() {
-                drop(slot.take());
-            }
             if let Ok(mut slot) = app.state::<MonitorState>().0.lock() {
                 drop(slot.monitor.take());
+            }
+            if let Ok(mut slot) = app.state::<WorkerState>().0.lock() {
+                drop(slot.take());
             }
         }
     });

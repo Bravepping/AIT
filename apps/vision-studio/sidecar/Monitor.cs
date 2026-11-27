@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -20,7 +21,9 @@ internal static class MonitorHost
 
     static void Emit(object message)
     {
-        lock (output) Console.WriteLine(json.Serialize(message));
+        // The UDP worker must finish restoring the axes even if its parent closed stdout.
+        try { lock (output) Console.WriteLine(json.Serialize(message)); }
+        catch (IOException) { }
     }
 
     static void Publish(KmBox.Snapshot current)
@@ -32,7 +35,8 @@ internal static class MonitorHost
         if (previous != null && !freshNearDeadline && now - lastSent < updateIntervalMs && current.Connected == previous.Connected &&
             current.Monitoring == previous.Monitoring && current.Buttons == previous.Buttons &&
             current.Halted == previous.Halted && current.Busy == previous.Busy && current.Connection == previous.Connection &&
-            current.Monitor == previous.Monitor && current.TraceActive == previous.TraceActive) return;
+            current.Monitor == previous.Monitor && current.TraceActive == previous.TraceActive &&
+            current.AxisStatus == previous.AxisStatus) return;
         previous = current;
         lastSent = now;
         Emit(new { kind = "kmbox", connected = current.Connected, monitoring = current.Monitoring,
@@ -43,7 +47,8 @@ internal static class MonitorHost
             heartbeat_acks = current.HeartbeatAcks, wire_trace_active = current.TraceActive,
             stationary_reports = current.StationaryReports, stationary_ms = current.StationaryDuration,
             stationary_max_gap_ms = current.StationaryMaxGap,
-            connection = current.Connection, monitor = current.Monitor, halted = current.Halted });
+            connection = current.Connection, monitor = current.Monitor, halted = current.Halted,
+            xy_status = current.AxisStatus });
     }
 
     static string Value(Dictionary<string, object> message, string key)
@@ -64,9 +69,14 @@ internal static class MonitorHost
                 {
                     Dictionary<string, object> message;
                     lock (output) message = json.Deserialize<Dictionary<string, object>>(line);
-                    switch (Value(message, "cmd"))
+                    string command = Value(message, "cmd");
+                    if (command == "exit")
                     {
-                        case "exit": StopConfirmation(); return;
+                        device.Emergency(false);
+                        break;
+                    }
+                    switch (command)
+                    {
                         case "confirm_input":
                             string[] pairing = Value(message, "pairing").Trim().Split('/');
                             IPAddress inputAddress;
@@ -122,6 +132,16 @@ internal static class MonitorHost
 #if KMBOX_AUTO_TRACKING
                         case "auto_enable":
                             Emit(device.EnableAuto() ? new { kind = "auto_available" } : new { kind = "auto_unavailable" });
+                            break;
+                        case "auto_takeover":
+                            int triggerReport;
+                            long takeoverId, triggerAt;
+                            if (!long.TryParse(Value(message, "id"), out takeoverId) || takeoverId <= 0 ||
+                                !int.TryParse(Value(message, "report"), out triggerReport) ||
+                                !long.TryParse(Value(message, "report_at_ms"), out triggerAt))
+                                throw new ArgumentException("无效的接管报文");
+                            Action<string> takeover = status => Emit(new { kind = "auto_takeover_status", id = takeoverId, status = status });
+                            if (!device.TakeOver(triggerReport, triggerAt, takeover)) takeover("rejected");
                             break;
                         case "auto_stop":
                             device.StopAuto();

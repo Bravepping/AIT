@@ -20,7 +20,8 @@ export type Profile = {
   referenceY: number
   lostWaitMs: number
   dynamicRange?: number
-  motion: { algorithm: 'p' | 'pd'; derivativeMs: [number, number]; predictionMs: number; slowRadiusPx: number; adaptive: boolean }
+  motion: { algorithm: 'p' | 'pd'; derivativeMs: [number, number]; predictionMs: number; slowRadiusPx: number; adaptive: boolean;
+    acquisitionGain: number; transitionPx: number }
 }
 export const newProfile = (id: number): Profile => ({
   id, name: id === 1 ? '左右键组合' : `方案 ${id}`, mask: 3, mode: 'hold', scope: 'all',
@@ -29,10 +30,11 @@ export const newProfile = (id: number): Profile => ({
   gainX: 1, gainY: 1, invertX: false, invertY: false, maxStep: 24,
   deadZonePx: 2, smoothHalfLifeMs: 12, switchConfirmFrames: 2,
   classRules: Object.fromEntries(classIds.map(id => [id, { threshold: '', priority: 0 }])),
-  maxSpeed: 480, acceleration: 4000, trackingGain: [0.35, 0.35],
+  maxSpeed: 120, acceleration: 4000, trackingGain: [0.35, 0.35],
   referenceX: 50, referenceY: 50,
   lostWaitMs: 120,
-  motion: { algorithm: 'p', derivativeMs: [16, 16], predictionMs: 0, slowRadiusPx: 0, adaptive: false },
+  motion: { algorithm: 'pd', derivativeMs: [16, 16], predictionMs: 0, slowRadiusPx: 40, adaptive: true,
+    acquisitionGain: 2.5, transitionPx: 24 },
 })
 
 export type Preferences = {
@@ -92,7 +94,7 @@ export function parseBackup(serialized: string): Backup {
     const numbers = [migrated.confidence, migrated.anchorX, migrated.anchorY, migrated.rangePercent,
       migrated.gainX, migrated.gainY, migrated.deadZonePx, migrated.smoothHalfLifeMs, migrated.switchConfirmFrames,
       migrated.maxSpeed, migrated.acceleration, migrated.referenceX, migrated.referenceY, migrated.lostWaitMs,
-      migrated.motion.predictionMs, migrated.motion.slowRadiusPx]
+      migrated.motion.predictionMs, migrated.motion.slowRadiusPx, migrated.motion.acquisitionGain, migrated.motion.transitionPx]
     if (!numbers.every(finite) || (entry.maxStep !== undefined && !integer(entry.maxStep, 1, 24)) ||
       !integer(migrated.single, 0, 6) || !Array.isArray(migrated.classes) || !migrated.classes.every((v) => integer(v, 0, 6)) ||
       !pair(migrated.trackingGain, finite) || !pair(migrated.motion.derivativeMs, finite) ||

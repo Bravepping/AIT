@@ -1,4 +1,4 @@
-use crate::movement::{Dispatcher, DryRunDriver, HeldInput, KmBoxDriver, MotionConfig, Smoothing, KMBOX_AXIS_LIMIT};
+use crate::movement::{Dispatcher, DryRunDriver, HeldInput, KmBoxDriver, MotionConfig, MotionPhase, Smoothing, KMBOX_AXIS_LIMIT};
 use crate::tracking::{Observation, Tracker};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,6 +10,9 @@ use std::{
 const BUTTON_TIMEOUT: Duration = Duration::from_millis(1200);
 const CONFIRMATION_TIMEOUT_MS: u64 = 150;
 const LINK_CONFIRMATION_TIMEOUT_MS: u64 = 1200;
+const LIVE_HOTKEY: u8 = 3;
+const LIVE_INITIAL_RADIUS_PX: f64 = 64.0;
+const LIVE_MAX_SPEED: u16 = 120;
 pub(crate) const FRAME_TIMEOUT_MS: u64 = 150;
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -198,6 +201,7 @@ struct TargetLock {
     missing: bool,
     waiting: bool,
     challenger: Option<(u64, u8, u64)>,
+    motion_phase: Option<MotionPhase>,
 }
 
 #[derive(Serialize)]
@@ -225,29 +229,34 @@ struct Candidate {
     selection_ms: f64,
     movement_ms: f64,
     selection_reason: &'static str,
+    control_phase: Option<MotionPhase>,
 }
 
 const NO_TARGET: &str = "没有满足置信度、类别和有效范围的检测框";
 
 impl Frame {
     fn select(&self, profile: &Profile, lock: &mut TargetLock, smoothing: &mut Smoothing) -> Option<Candidate> {
-        self.select_with_range(profile, lock, smoothing, f64::INFINITY, [1.0; 2])
+        self.select_with_motion(profile, lock, smoothing, false)
     }
 
-    fn select_with_range(&self, profile: &Profile, lock: &mut TargetLock, smoothing: &mut Smoothing,
-        max_range_px: f64, tracking_gain: [f64; 2]) -> Option<Candidate> {
+    fn select_with_motion(&self, profile: &Profile, lock: &mut TargetLock, smoothing: &mut Smoothing,
+        dual_stage: bool) -> Option<Candidate> {
         let started = Instant::now();
         let dimensions = [self.width, self.height];
         if dimensions.contains(&0) {
             return None;
         }
+        // The decoder has already undone model letterboxing. Bounds and reference are in the source NDI frame.
         let image = dimensions.map(f64::from);
         let reference = [image[0] * profile.reference_x.unwrap_or(50.0) / 100.0,
             image[1] * profile.reference_y.unwrap_or(50.0) / 100.0];
-        let range = (image[0].min(image[1]) * profile.range_percent / 200.0).min(max_range_px);
+        let max_initial_range_px = if dual_stage { LIVE_INITIAL_RADIUS_PX } else { f64::INFINITY };
+        let configured_range = image[0].min(image[1]) * profile.range_percent / 200.0;
+        let range = if profile.dynamic_range_percent.is_some() { configured_range }
+            else { configured_range.min(max_initial_range_px) };
         let initial_range = profile.dynamic_range_percent.map_or(range, |percent| {
             (image[0].min(image[1]) * percent / 200.0).min(range)
-        });
+        }).min(max_initial_range_px);
         if lock.missing && lock.incumbent.is_some_and(|(_, _, seen)| {
             self.frame_at.saturating_sub(seen) > profile.lost_wait_ms
         }) {
@@ -300,6 +309,7 @@ impl Frame {
         });
         let Some((TargetMatch { observation, anchor, score, .. }, track, radius)) = selected else {
             lock.challenger = None;
+            lock.motion_phase = None;
             smoothing.reset();
             if lock.incumbent.is_some() {
                 lock.waiting = true;
@@ -332,14 +342,23 @@ impl Frame {
         lock.waiting = false;
         let selected_at = Instant::now();
         let offset = [anchor[0] - reference[0], anchor[1] - reference[1]];
-        let scale = [profile.gain_x * tracking_gain[0] * if profile.invert_x { -1.0 } else { 1.0 },
-                     profile.gain_y * tracking_gain[1] * if profile.invert_y { -1.0 } else { 1.0 }];
+        let distance = offset[0].hypot(offset[1]);
+        let phase = dual_stage.then(|| profile.motion.phase(lock.motion_phase, distance));
+        if phase != lock.motion_phase { smoothing.reset(); }
+        lock.motion_phase = phase;
+        let (motion, boost, half_life_ms) = if phase == Some(MotionPhase::Acquisition) {
+            let (motion, boost) = profile.motion.for_acquisition(distance);
+            (motion, boost, profile.smooth_half_life_ms.min(4.0))
+        } else { (profile.motion, 1.0, profile.smooth_half_life_ms) };
+        let gain = if dual_stage { profile.tracking_gain } else { [1.0; 2] };
+        let scale = [profile.gain_x * gain[0] * boost * if profile.invert_x { -1.0 } else { 1.0 },
+                     profile.gain_y * gain[1] * boost * if profile.invert_y { -1.0 } else { 1.0 }];
         let adjusted = profile.dead_zone_axes.map_or(offset, |zones| std::array::from_fn(|axis| {
             if offset[axis].abs() <= zones[axis] { 0.0 } else { offset[axis] }
         }));
         let radial = if profile.dead_zone_axes.is_some() { 0.0 } else { profile.dead_zone_px };
         let relative = smoothing.controlled(adjusted, track.velocity, scale, radial,
-            profile.smooth_half_life_ms, profile.max_step, self.frame_at, &profile.motion);
+            half_life_ms, profile.max_step, self.frame_at, &motion);
         let computed_at_ms = now_ms();
         Some(Candidate {
             profile_id: profile.id, class: observation.class, score, bounds: observation.bounds,
@@ -351,7 +370,7 @@ impl Frame {
             decision_ms: started.elapsed().as_secs_f64() * 1000.0,
             selection_ms: selected_at.duration_since(started).as_secs_f64() * 1000.0,
             movement_ms: selected_at.elapsed().as_secs_f64() * 1000.0,
-            selection_reason,
+            selection_reason, control_phase: phase,
         })
     }
 }
@@ -390,6 +409,7 @@ pub struct AutomationController<D = DryRunDriver> {
     state: AutomationState,
     auto_preview_pending: bool,
     real: Option<RealTracking>,
+    rearm_after_release: Option<u32>,
     reason: &'static str,
     active: Option<usize>,
     buttons: u8,
@@ -415,7 +435,7 @@ pub struct AutomationController<D = DryRunDriver> {
 }
 
 struct RealTracking {
-    profiles: HashSet<u32>,
+    binding: usize,
     armed_frame: u64,
     crop: [u32; 2],
 }
@@ -426,7 +446,7 @@ impl Default for AutomationController<DryRunDriver> {
 
 impl<D: KmBoxDriver> AutomationController<D> {
     pub(crate) fn with_driver(driver: D) -> Self {
-        Self { bindings: Vec::new(), state: AutomationState::Idle, auto_preview_pending: true, real: None,
+        Self { bindings: Vec::new(), state: AutomationState::Idle, auto_preview_pending: true, real: None, rearm_after_release: None,
             reason: "等待实时状态", active: None,
             buttons: 0, report_at: None, physical_report: None, confirmation: None, confirmation_used: false,
             link_at: 0, source: 0, source_name: String::new(), device: String::new(), model: 0, stream_live: false, video_at: None,
@@ -464,6 +484,10 @@ impl<D: KmBoxDriver> AutomationController<D> {
         matches!(self.state, AutomationState::Armed | AutomationState::Running)
     }
 
+    fn real_requested(&self) -> bool {
+        self.real.is_some() || self.rearm_after_release.is_some()
+    }
+
     fn reset_activation(&mut self) {
         for binding in &mut self.bindings {
             binding.reset(self.buttons);
@@ -489,8 +513,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
         self.stop(AutomationState::Stopped, reason)
     }
 
-    pub fn stop_manual(&mut self, emergency: bool) -> Value {
-        self.disarm(if emergency { "F8 紧急停止，请重新武装" } else { "已停止跟随，请按需重新启用" })
+    pub fn stop_manual(&mut self) -> Value {
+        self.disarm("已停止跟随，请按需重新启用")
     }
 
     fn stop(&mut self, state: AutomationState, reason: &'static str) -> Value {
@@ -499,7 +523,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
             let inference_frame_at = self.frame.as_ref().map(|frame| frame.frame_at);
             self.last_stop = Some(StopDiagnostic {
                 id: self.last_stop.as_ref().map_or(1, |stop| stop.id + 1), at_ms: at, reason,
-                previous_state: self.state, mode: if self.real.is_some() { "real" } else { "dry_run" },
+                previous_state: self.state, mode: if self.real_requested() { "real" } else { "dry_run" },
                 video_frame_at_ms: self.video_at, video_age_ms: self.video_at.and_then(|time| at.checked_sub(time)),
                 inference_frame_at_ms: inference_frame_at, inference_age_ms: inference_frame_at.and_then(|time| at.checked_sub(time)),
                 age_limit_ms: FRAME_TIMEOUT_MS, frame_sequence: self.frame.as_ref().map(|frame| frame.sequence),
@@ -508,14 +532,15 @@ impl<D: KmBoxDriver> AutomationController<D> {
                 cleared_pending: self.movement.has_pending(),
             });
         }
-        self.leave_real();
         self.reset_activation();
+        self.leave_real();
         self.state = state;
         self.reason = reason;
         self.snapshot()
     }
 
     fn leave_real(&mut self) {
+        self.rearm_after_release = None;
         if self.real.take().is_some() { self.movement.driver.stop_live(); }
     }
 
@@ -566,7 +591,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
         if self.frame.as_ref().is_none_or(|frame| !frame_fresh(frame.frame_at)) {
             return Some("推理结果已过期");
         }
-        if self.real.is_some() && !recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS) {
+        if self.real_requested() && !recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS) {
             return Some("KMBox 连接应答已过期");
         }
         if self.confirmation_used && !self.confirmed_hold() {
@@ -590,8 +615,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
         Ok(self.snapshot())
     }
 
-    pub fn arm_real(&mut self, profile_id: u32, all_profiles: bool) -> Result<Value, String> {
-        if self.real.is_some() { return Err("请先停止当前的真实跟随".into()); }
+    pub fn arm_real(&mut self, profile_id: u32) -> Result<Value, String> {
+        if self.real_requested() { return Err("请先停止当前的真实跟随".into()); }
         if let Some(reason) = self.blocker() { return Err(reason.into()); }
         if !recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS) || self.physical_report.is_none()
             || self.report_at.is_none_or(|at| at.elapsed() > BUTTON_TIMEOUT)
@@ -600,32 +625,28 @@ impl<D: KmBoxDriver> AutomationController<D> {
         }
         if self.buttons != 0 { return Err("先松开鼠标按键，再武装真实跟随".into()); }
         let frame = self.frame.as_ref().ok_or("等待推理结果")?;
-        let bindings: Vec<_> = self.bindings.iter().filter(|binding| !binding.profile.toggle
-            && (all_profiles || binding.profile.id == profile_id)).collect();
-        if bindings.is_empty() { return Err("请选择已启用的按住式热键方案".into()); }
-        for binding in &bindings {
-            let profile = &binding.profile;
-            if !profile.enabled_classes.iter().any(|class| profile.includes(*class)) {
-                return Err(format!("{}没有可用的识别类别", profile.name));
-            }
-            let valid = profile.calibration_site.as_ref().is_some_and(|site| {
-                site.source == self.source_name && !site.source.is_empty() && site.device == self.device && !site.device.is_empty()
-                    && site.crop == [frame.width, frame.height]
-                    && site.crop.into_iter().zip(site.desktop).all(|(crop, desktop)| crop > 0 && crop <= desktop)
-                    && site.observed.into_iter().zip([(profile.gain_x, profile.invert_x), (profile.gain_y, profile.invert_y)])
-                        .all(|(measured, (gain, invert))| measured.is_finite()
-                            && measured.is_sign_negative() == invert && (10.0 / measured.abs() - gain).abs() < 0.000001)
-            });
-            if !valid { return Err(format!("{}：请校准当前 NDI 源和裁剪尺寸", profile.name)); }
+        let binding = self.bindings.iter().position(|binding| !binding.profile.toggle && binding.profile.id == profile_id)
+            .ok_or("请选择一个已启用的按住式方案")?;
+        let profile = &self.bindings[binding].profile;
+        if profile.enabled_classes.iter().copied().filter(|class| profile.includes(*class)).collect::<HashSet<_>>().len() != 1 {
+            return Err(format!("{}：首轮实机测试请选择一个识别类别", profile.name));
         }
-        let real = RealTracking { profiles: bindings.iter().map(|binding| binding.profile.id).collect(),
-            armed_frame: frame.sequence, crop: [frame.width, frame.height] };
+        let valid = profile.calibration_site.as_ref().is_some_and(|site| {
+            site.source == self.source_name && !site.source.is_empty() && site.device == self.device && !site.device.is_empty()
+                && site.crop == [frame.width, frame.height]
+                && site.crop.into_iter().zip(site.desktop).all(|(crop, desktop)| crop > 0 && crop <= desktop)
+                && site.observed.into_iter().zip([(profile.gain_x, profile.invert_x), (profile.gain_y, profile.invert_y)])
+                    .all(|(measured, (gain, invert))| measured.is_finite()
+                        && measured.is_sign_negative() == invert && (10.0 / measured.abs() - gain).abs() < 0.000001)
+        });
+        if !valid { return Err(format!("{}：请校准当前 NDI 源和裁剪尺寸", profile.name)); }
+        let real = RealTracking { binding, armed_frame: frame.sequence, crop: [frame.width, frame.height] };
         self.movement.driver.start_live()?;
         self.auto_preview_pending = false;
         self.reset_activation();
         self.real = Some(real);
         self.state = AutomationState::Armed;
-        self.reason = "真实跟随已武装，等待重新按下热键";
+        self.reason = "真实跟随已武装，等待按下左右键组合";
         Ok(self.snapshot())
     }
 
@@ -657,7 +678,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
 
     fn held_mask(&self) -> Option<u8> {
         self.active.and_then(|index| self.bindings.get(index)).filter(|binding| !binding.profile.toggle)
-            .map(|binding| binding.profile.mask)
+            .map(|binding| if self.real.is_some() { LIVE_HOTKEY } else { binding.profile.mask })
     }
 
     fn confirmed_hold(&self) -> bool {
@@ -678,7 +699,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     fn allows_report_gap(&self) -> bool {
-        !cfg!(feature = "kmbox-hold-diagnostics") && self.real.is_none() && (self.confirmed_hold() || (recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS)
+        if self.real.is_some() { return self.active.is_none(); }
+        !cfg!(feature = "kmbox-hold-diagnostics") && !self.real_requested() && (self.confirmed_hold() || (recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS)
             && (self.event_preview() || (self.active.is_none() && self.has_event_preview()))))
     }
 
@@ -758,11 +780,9 @@ impl<D: KmBoxDriver> AutomationController<D> {
         if let Some(reason) = self.blocker() {
             return Some(self.stop(AutomationState::Fault, reason));
         }
+        if self.real.is_some() { return self.live_buttons(); }
         for binding in &mut self.bindings {
             binding.update(self.buttons);
-        }
-        if self.real.is_some() && self.active.is_some_and(|index| !self.bindings[index].down) {
-            return Some(self.stop(AutomationState::Stopped, "真实跟随热键已释放，请重新武装"));
         }
         if self.active.is_some_and(|index| {
             let previous = &self.bindings[index];
@@ -775,23 +795,36 @@ impl<D: KmBoxDriver> AutomationController<D> {
             return Some(self.snapshot());
         }
         let next = self.bindings.iter().enumerate().filter(|(_, binding)| binding.active())
-            .filter(|(_, binding)| self.real.as_ref().is_none_or(|real| real.profiles.contains(&binding.profile.id)))
             .max_by_key(|(index, binding)| (binding.profile.mask.count_ones(), std::cmp::Reverse(*index)))
             .map(|(index, _)| index);
         if self.active == next {
             return (cfg!(feature = "kmbox-hold-diagnostics") && mask_changed).then(|| self.snapshot());
         }
-        if self.real.is_some() && self.active.is_some() {
-            return Some(self.stop(AutomationState::Stopped, "热键方案已变化，请重新武装"));
-        }
         self.clear_target();
         self.active = next;
         self.confirmation_used = false;
-        if let Some(real) = &mut self.real {
-            self.lock.waiting = true;
-            if let Some(frame) = &self.frame { real.armed_frame = frame.sequence; }
-        }
         self.follow();
+        Some(self.snapshot())
+    }
+
+    fn live_buttons(&mut self) -> Option<Value> {
+        if self.buttons & LIVE_HOTKEY != LIVE_HOTKEY {
+            let active = self.active?;
+            let profile_id = self.bindings[active].profile.id;
+            self.stop(AutomationState::Stopped, "组合键已松开，等待确认解除物理 X/Y 屏蔽");
+            self.rearm_after_release = Some(profile_id);
+            return Some(self.snapshot());
+        }
+        if self.active.is_some() { return None; }
+        let (report, at_ms) = self.physical_report?;
+        let real = self.real.as_mut()?;
+        self.active = Some(real.binding);
+        self.lock.waiting = true;
+        if let Some(frame) = &self.frame { real.armed_frame = frame.sequence; }
+        if let Err(reason) = self.movement.driver.take_over(HeldInput { mask: LIVE_HOTKEY, report, at_ms }) {
+            return Some(self.stop(AutomationState::Fault, reason));
+        }
+        self.reason = "等待 KMBox 屏蔽物理 X/Y 应答";
         Some(self.snapshot())
     }
 
@@ -825,6 +858,16 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     pub(crate) fn tick_at(&mut self, now: Instant) -> Option<Value> {
+        if let Some(profile_id) = self.rearm_after_release {
+            if let Some(reason) = self.blocker() { return Some(self.stop(AutomationState::Fault, reason)); }
+            if self.buttons == 0 && self.movement.driver.can_arm_live() {
+                self.rearm_after_release = None;
+                return Some(self.arm_real(profile_id).unwrap_or_else(|_| {
+                    self.stop(AutomationState::Fault, "KMBox 未能重新武装，请重新开始真实跟随")
+                }));
+            }
+            return None;
+        }
         if self.armed() {
             if let Some(reason) = self.blocker() {
                 return Some(self.stop(AutomationState::Fault, reason));
@@ -846,21 +889,26 @@ impl<D: KmBoxDriver> AutomationController<D> {
         let selected = self.active.and_then(|index| self.bindings.get(index));
         let resolution = selected.zip(self.frame.as_ref()).and_then(|(binding, frame)| {
             let intent = if self.real.is_some() {
-                frame.select_with_range(&binding.profile, &mut self.lock, &mut self.smoothing, f64::INFINITY, binding.profile.tracking_gain)
+                frame.select_with_motion(&binding.profile, &mut self.lock, &mut self.smoothing, true)
             } else {
                 frame.select(&binding.profile, &mut self.lock, &mut self.smoothing)
             };
             intent.map(|intent| (frame.frame_at, intent))
         });
         if let Some((timestamp, intent)) = resolution {
-            let held = selected.filter(|binding| !binding.profile.toggle).and_then(|binding| {
-                self.physical_report.map(|(report, at_ms)| HeldInput { mask: binding.profile.mask, report, at_ms })
+            let held = self.held_mask().and_then(|mask| {
+                self.physical_report.map(|(report, at_ms)| HeldInput { mask, report, at_ms })
             });
             if let Some((_, binding)) = self.real.as_ref().zip(selected) {
+                if !self.movement.driver.axes_taken() {
+                    self.candidate = Some((timestamp, intent));
+                    return;
+                }
+                let maximum = binding.profile.max_speed.min(LIVE_MAX_SPEED);
+                let speed = if intent.control_phase == Some(MotionPhase::Acquisition) { maximum }
+                    else { binding.profile.motion.speed(intent.offset[0].hypot(intent.offset[1]), maximum) };
                 self.movement.offer_live(timestamp, intent.sequence, intent.relative, Instant::now(), held,
-                    binding.profile.motion.speed(intent.offset[0].hypot(intent.offset[1]), binding.profile.max_speed),
-                    binding.profile.acceleration,
-                    (intent.lock_id, intent.class));
+                    speed, binding.profile.acceleration, (intent.lock_id, intent.class));
             } else if !self.event_preview() {
                 self.movement.offer(timestamp, intent.sequence, intent.relative, Instant::now(), held);
             }
@@ -868,11 +916,12 @@ impl<D: KmBoxDriver> AutomationController<D> {
             self.state = AutomationState::Running;
             self.reason = if self.real.is_some() { "真实跟随" } else { "Dry Run" };
         } else {
-            if self.real.is_some() && previously_locked {
-                self.stop(AutomationState::Fault, "锁定目标已丢失，请重新武装");
+            if self.real.is_some() && self.active.is_some() && (previously_locked || self.lock.challenger.is_none()) {
+                self.stop(AutomationState::Fault, if previously_locked { "锁定目标已丢失，请重新武装" } else { NO_TARGET });
                 return;
             }
-            self.reason = if self.active.is_none() { "等待物理热键" }
+            self.reason = if self.real.is_some() && !self.movement.driver.axes_taken() { "等待 KMBox 屏蔽物理 X/Y 应答" }
+                else if self.active.is_none() { "等待物理热键" }
                 else if self.lock.waiting { "锁定目标已离开，等待确认新目标" }
                 else { NO_TARGET };
             self.clear_candidate();
@@ -959,7 +1008,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
         json!({"kind":"dry_run", "state":self.state, "armed":self.armed(), "active":active.is_some(),
                "profile_id":active.map(|binding| binding.profile.id), "profile_name":active.map(|binding| &binding.profile.name),
                "candidate":candidate, "reason":self.reason,
-               "mode":if self.real.is_some() { "real" } else { "dry_run" },
+               "mode":if self.real_requested() { "real" } else { "dry_run" },
                "real_control_available":self.real.is_some(),
                "scheduled":self.movement.submitted, "expired":self.movement.expired,
                "queue_ms":self.movement.last_queue_ms,
@@ -991,7 +1040,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     pub(crate) fn live_fault(&mut self, reason: &'static str) -> Option<Value> {
-        self.real.is_some().then(|| self.stop(AutomationState::Fault, reason))
+        self.real_requested().then(|| self.stop(AutomationState::Fault, reason))
     }
 
     pub(crate) fn source_revision(&self) -> u32 { self.source }
@@ -1051,6 +1100,51 @@ mod tracking_tests {
 
     fn detection(x: f64, category: f64) -> [f64; 6] {
         [x - 22.0, 298.0, x + 22.0, 342.0, 0.9, category]
+    }
+
+    #[test]
+    fn dual_stage_uses_source_frame_crosshair_and_moves_in_all_four_directions() {
+        let profile = Profile { enabled_classes: vec![0], reference_x: Some(37.5), reference_y: Some(60.0),
+            ..Profile::default() };
+        for [dx, dy] in [[48.0, 0.0], [-48.0, 0.0], [0.0, 48.0], [0.0, -48.0]] {
+            let [x, y] = [600.0 + dx, 540.0 + dy];
+            let frame = Frame { source: 1, model: 1, frame_at: 16, sequence: 1, width: 1600, height: 900,
+                boxes: vec![[x - 22.0, y - 22.0, x + 22.0, y + 22.0, 0.9, 0.0]] };
+            let candidate = frame.select_with_motion(&profile, &mut TargetLock::default(), &mut Smoothing::default(), true).unwrap();
+            assert_eq!(candidate.reference, [600.0, 540.0]);
+            assert_eq!(candidate.offset, [dx, dy]);
+            assert!(candidate.control_phase == Some(MotionPhase::Acquisition));
+            assert_eq!(candidate.relative.map(i32::signum), [dx as i32, dy as i32].map(i32::signum));
+        }
+    }
+
+    #[test]
+    fn dual_stage_slows_near_target_preserves_identity_and_respects_dead_zone() {
+        let profile = serde_json::from_value(json!({"enabled_classes":[0],"dead_zone_px":3.0,
+            "motion":{"algorithm":"pd","transition_px":24,"slow_radius_px":40,"adaptive":true,
+                "derivative_ms":[16,16],"prediction_ms":8}})).unwrap();
+        let (mut lock, mut smoothing) = (TargetLock::default(), Smoothing::default());
+        let mut select = |sequence, x| {
+            Frame { source: 1, model: 1, frame_at: sequence * 16, sequence, width: 640, height: 640,
+                boxes: vec![detection(x, 0.0)] }.select_with_motion(&profile, &mut lock, &mut smoothing, true).unwrap()
+        };
+        let far = select(1, 372.0);
+        select(2, 355.0);
+        let near = select(3, 340.0);
+        assert_eq!(near.reference, [320.0, 320.0]);
+        assert!(far.control_phase == Some(MotionPhase::Acquisition));
+        assert!(near.control_phase == Some(MotionPhase::Tracking));
+        assert!(far.relative[0] > near.relative[0] && near.relative[0] >= 0);
+        assert_eq!(near.track_id, far.track_id);
+        let moving = select(4, 349.0);
+        assert!(moving.control_phase == Some(MotionPhase::Tracking));
+        assert_eq!(moving.track_id, far.track_id);
+        assert!(moving.relative[0] > 0);
+        for (sequence, x) in [(5, 336.0), (6, 323.0), (7, 322.5), (8, 322.0)] {
+            let sample = select(sequence, x);
+            assert_eq!(sample.track_id, far.track_id);
+            if sequence >= 6 { assert_eq!(sample.relative, [0, 0]); }
+        }
     }
 
     #[test]

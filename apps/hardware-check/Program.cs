@@ -4,7 +4,9 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Net;
+#if !KMBOX_CALIBRATION
 using System.Runtime.InteropServices;
+#endif
 using System.Text;
 using System.Windows.Forms;
 
@@ -55,15 +57,19 @@ namespace VisionHardwareCheck
 
     internal sealed class CheckForm : Form
     {
+#if !KMBOX_CALIBRATION
         const int StopHotkey = 1;
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
         [DllImport("user32.dll")]
         static extern bool UnregisterHotKey(IntPtr window, int id);
+        readonly Label f8 = new Label();
+        bool hotkeyRegistered;
+#endif
 
         readonly TextBox ip = new TextBox(), port = new TextBox(), mac = new TextBox();
         readonly NumericUpDown monitorPort = new NumericUpDown();
-        readonly Label connection = new Label(), health = new Label(), stationary = new Label(), combo = new Label(), f8 = new Label();
+        readonly Label connection = new Label(), health = new Label(), stationary = new Label(), combo = new Label();
         readonly Label[] indicators = new Label[5];
         readonly Button[] moves = new Button[4];
         readonly Button connect = new Button(), disconnect = new Button(), monitor = new Button(), resume = new Button();
@@ -71,7 +77,7 @@ namespace VisionHardwareCheck
         readonly Timer timer = new Timer();
         readonly ConcurrentQueue<string> pendingLogs = new ConcurrentQueue<string>();
         readonly KmBox box;
-        bool hotkeyRegistered, disposed;
+        bool disposed;
 #if PHASE2
         VisionForm vision;
 #endif
@@ -102,7 +108,9 @@ namespace VisionHardwareCheck
             BackColor = Color.FromArgb(243, 246, 250);
             ForeColor = Color.FromArgb(30, 42, 60);
             AutoScaleMode = AutoScaleMode.Dpi;
+#if !KMBOX_CALIBRATION
             KeyPreview = true;
+#endif
             box = new KmBox(Log);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 1, RowCount = 6 };
@@ -222,11 +230,17 @@ namespace VisionHardwareCheck
 
             var actions = Row();
             var stop = new Button();
+#if KMBOX_CALIBRATION
+            AddButton(actions, stop, "紧急停止", (s, e) => StopAll());
+#else
             AddButton(actions, stop, "紧急停止 · F8", (s, e) => StopAll());
+#endif
             stop.ForeColor = Color.Firebrick;
             AddButton(actions, resume, "解除急停", (s, e) => { if (!box.Resume()) Log("解除急停被拒绝，请等待当前操作结束。"); });
             AddButton(actions, new Button(), "导出日志", (s, e) => Export());
+#if !KMBOX_CALIBRATION
             actions.Controls.Add(Inline(f8, 360));
+#endif
             root.Controls.Add(actions, 0, 4);
 
             events.Multiline = true;
@@ -243,6 +257,7 @@ namespace VisionHardwareCheck
             RefreshView();
         }
 
+#if !KMBOX_CALIBRATION
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -269,6 +284,7 @@ namespace VisionHardwareCheck
             StopAll();
             return true;
         }
+#endif
 
         void StopAll()
         {

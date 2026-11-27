@@ -31,7 +31,10 @@ pub struct MoveContext {
 pub trait KmBoxDriver {
     fn submit_relative(&mut self, movement: RelativeMove, context: MoveContext) -> Result<(), &'static str>;
     fn ready(&self) -> bool { true }
+    fn can_arm_live(&self) -> bool { false }
     fn start_live(&mut self) -> Result<(), &'static str> { Err("真实控制接口未连接") }
+    fn take_over(&mut self, _: HeldInput) -> Result<(), &'static str> { Err("真实控制接口未连接") }
+    fn axes_taken(&self) -> bool { false }
     fn stop_live(&mut self) {}
 }
 
@@ -88,11 +91,44 @@ impl MonitorWriter {
 #[derive(Default)]
 pub(crate) struct RuntimeDriver {
     pub pipe: Option<MonitorWriter>,
-    live: bool,
+    permission: LivePermission,
+    restored: bool,
+    box_busy: bool,
+    recovery_unconfirmed: bool,
+    takeover_id: u64,
     outstanding: Option<(MoveContext, Instant)>,
 }
 
+#[derive(Default)]
+enum LivePermission {
+    #[default]
+    Stopped,
+    Armed,
+    Masking(Instant),
+    Active,
+}
+
 impl RuntimeDriver {
+    pub fn observe_axes(&mut self, status: Option<&str>, busy: bool) {
+        self.restored = status == Some("restored");
+        self.box_busy = busy;
+        match status {
+            Some("restored") => self.recovery_unconfirmed = false,
+            Some("masking" | "masked" | "restoring" | "recovery_pending") => self.recovery_unconfirmed = true,
+            _ => {}
+        }
+    }
+
+    pub fn takeover_result(&mut self, id: u64, acknowledged: bool) -> Option<bool> {
+        if id != self.takeover_id || !matches!(self.permission, LivePermission::Masking(_)) { return None; }
+        if acknowledged { self.permission = LivePermission::Active; }
+        Some(acknowledged)
+    }
+
+    pub fn axes_need_recovery(&self) -> bool {
+        matches!(self.permission, LivePermission::Masking(_) | LivePermission::Active) || self.recovery_unconfirmed
+    }
+
     pub fn result(&mut self, id: u64) -> Option<(Option<(u64, u16, u64)>, Duration, f64)> {
         let (pending, started) = self.outstanding?;
         if id != pending.id { return None; }
@@ -101,7 +137,8 @@ impl RuntimeDriver {
     }
 
     pub fn timed_out(&self) -> bool {
-        self.outstanding.is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(300))
+        self.outstanding.is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(300)) ||
+            matches!(self.permission, LivePermission::Masking(at) if at.elapsed() > Duration::from_millis(600))
     }
 
     pub fn detach(&mut self) {
@@ -110,14 +147,16 @@ impl RuntimeDriver {
     }
 
     pub fn reset_connection(&mut self) {
-        self.live = false;
+        self.permission = LivePermission::Stopped;
+        self.restored = false;
         self.outstanding = None;
     }
 }
 
 impl KmBoxDriver for RuntimeDriver {
     fn submit_relative(&mut self, movement: RelativeMove, context: MoveContext) -> Result<(), &'static str> {
-        if !self.live { return Ok(()); }
+        if context.target.is_none() { return Ok(()); }
+        if !self.axes_taken() { return Err("KMBox 尚未应答屏蔽物理 X/Y"); }
         let pipe = self.pipe.as_ref().ok_or("KMBox 控制进程未连接")?;
         let mut request = KmBoxPipe(Vec::new());
         request.submit_relative(movement, context)?;
@@ -128,17 +167,35 @@ impl KmBoxDriver for RuntimeDriver {
 
     fn ready(&self) -> bool { self.outstanding.is_none() }
 
+    fn can_arm_live(&self) -> bool { self.restored && !self.box_busy && self.ready() }
+
     fn start_live(&mut self) -> Result<(), &'static str> {
         if self.outstanding.is_some() { return Err("上一条 KMBox 命令尚未完成"); }
+        if !self.restored { return Err("请先确认 KMBox 已解除物理 X/Y 屏蔽"); }
         self.pipe.as_ref().ok_or("KMBox 控制进程未连接")?
             .message(&serde_json::json!({"cmd":"auto_enable"})).map_err(|_| "KMBox 武装传输失败")?;
-        self.live = true;
+        self.permission = LivePermission::Armed;
         Ok(())
     }
 
+    fn take_over(&mut self, held: HeldInput) -> Result<(), &'static str> {
+        if !matches!(self.permission, LivePermission::Armed) { return Err("KMBox 未武装"); }
+        self.takeover_id += 1;
+        self.restored = false;
+        self.recovery_unconfirmed = true;
+        self.permission = LivePermission::Masking(Instant::now());
+        self.pipe.as_ref().ok_or("KMBox 控制进程未连接")?.message(&serde_json::json!({
+            "cmd":"auto_takeover", "id":self.takeover_id, "report":held.report, "report_at_ms":held.at_ms,
+        })).map_err(|_| "KMBox 接管传输失败")?;
+        Ok(())
+    }
+
+    fn axes_taken(&self) -> bool { matches!(self.permission, LivePermission::Active) }
+
     fn stop_live(&mut self) {
-        if self.live {
-            self.live = false;
+        if !matches!(self.permission, LivePermission::Stopped) {
+            self.permission = LivePermission::Stopped;
+            self.outstanding = None;
             if let Some(pipe) = &self.pipe {
                 let _ = pipe.message(&serde_json::json!({"cmd":"auto_stop"}));
             }
@@ -166,12 +223,13 @@ pub struct Dispatcher<D> {
     pub(crate) expired: u64,
     pub(crate) last_queue_ms: Option<f64>,
     live_rate: [f64; 2],
+    live_fraction: [f64; 2],
 }
 
 impl<D: KmBoxDriver> Dispatcher<D> {
     pub fn new(driver: D) -> Self {
         Self { driver, pending: None, last: None, submitted: 0, expired: 0,
-            last_queue_ms: None, live_rate: [0.0; 2] }
+            last_queue_ms: None, live_rate: [0.0; 2], live_fraction: [0.0; 2] }
     }
 
     pub fn offer(&mut self, frame_at: u64, sequence: u64, [dx, dy]: [i32; 2], now: Instant, held: Option<HeldInput>) {
@@ -189,12 +247,14 @@ impl<D: KmBoxDriver> Dispatcher<D> {
             command.target = Some((target.0, target.1, frame_at));
         } else {
             self.live_rate = [0.0; 2];
+            self.live_fraction = [0.0; 2];
         }
     }
 
     pub fn clear(&mut self) {
         self.pending = None;
         self.live_rate = [0.0; 2];
+        self.live_fraction = [0.0; 2];
         self.last_queue_ms = None;
     }
 
@@ -247,15 +307,33 @@ impl<D: KmBoxDriver> Dispatcher<D> {
         let magnitude = desired[0].hypot(desired[1]);
         let scale = (speed / magnitude).min(1.0);
         let desired = desired.map(|value| value * scale);
-        for (previous, target) in self.live_rate.iter_mut().zip(desired) {
-            if target.signum() != previous.signum() { *previous = 0.0; }
+        for (axis, target) in desired.into_iter().enumerate() {
+            let previous = &mut self.live_rate[axis];
+            if target == 0.0 || target.signum() != previous.signum() {
+                *previous = 0.0;
+                self.live_fraction[axis] = 0.0;
+            }
             if target.abs() < previous.abs() { *previous = target; }
         }
         let increase = [desired[0] - self.live_rate[0], desired[1] - self.live_rate[1]];
         let ramp = (acceleration_step / increase[0].hypot(increase[1])).min(1.0);
         self.live_rate[0] += increase[0] * ramp;
         self.live_rate[1] += increase[1] * ramp;
-        let [dx, dy] = self.live_rate.map(|axis| (axis * interval).trunc() as i32);
+        let step = self.live_rate.map(|rate| rate * interval);
+        let limit = step[0].hypot(step[1]).min(speed * interval);
+        let biased: [f64; 2] = std::array::from_fn(|axis| step[axis] + self.live_fraction[axis]);
+        let distance = |[x, y]: [f64; 2]| (x - biased[0]).powi(2) + (y - biased[1]).powi(2);
+        let mut chosen = step.map(f64::trunc);
+        // Carry sub-unit motion between sends while keeping each integer step inside the current limit.
+        for x in [step[0].floor(), step[0].ceil()] {
+            for y in [step[1].floor(), step[1].ceil()] {
+                if x.hypot(y) <= limit && distance([x, y]) < distance(chosen) {
+                    chosen = [x, y];
+                }
+            }
+        }
+        self.live_fraction = std::array::from_fn(|axis| (biased[axis] - chosen[axis]).clamp(-1.0, 1.0));
+        let [dx, dy] = chosen.map(|axis| axis as i32);
         RelativeMove { dx, dy }
     }
 }
@@ -273,7 +351,14 @@ pub(crate) enum Algorithm {
     Pd,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MotionPhase {
+    Acquisition,
+    Tracking,
+}
+
+#[derive(Clone, Copy, Deserialize)]
 #[serde(default)]
 pub(crate) struct MotionConfig {
     algorithm: Algorithm,
@@ -281,6 +366,15 @@ pub(crate) struct MotionConfig {
     prediction_ms: f64,
     slow_radius_px: f64,
     adaptive: bool,
+    acquisition_gain: f64,
+    transition_px: f64,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self { algorithm: Algorithm::P, derivative_ms: [0.0; 2], prediction_ms: 0.0,
+            slow_radius_px: 0.0, adaptive: false, acquisition_gain: 2.5, transition_px: 24.0 }
+    }
 }
 
 impl MotionConfig {
@@ -288,6 +382,21 @@ impl MotionConfig {
         self.derivative_ms.into_iter().all(|v| (0.0..=120.0).contains(&v))
             && (0.0..=80.0).contains(&self.prediction_ms)
             && (0.0..=160.0).contains(&self.slow_radius_px)
+            && (1.0..=8.0).contains(&self.acquisition_gain)
+            && (1.0..=160.0).contains(&self.transition_px)
+    }
+
+    pub fn phase(&self, previous: Option<MotionPhase>, distance: f64) -> MotionPhase {
+        // A wider exit threshold keeps jitter around the boundary from switching modes.
+        let threshold = if previous == Some(MotionPhase::Tracking) { self.transition_px * 1.5 }
+            else { self.transition_px };
+        if distance > threshold { MotionPhase::Acquisition } else { MotionPhase::Tracking }
+    }
+
+    pub fn for_acquisition(self, distance: f64) -> (Self, f64) {
+        let boost = ((distance - self.transition_px) / self.transition_px).clamp(0.0, 1.0);
+        (Self { algorithm: Algorithm::P, prediction_ms: 0.0, slow_radius_px: 0.0, adaptive: false, ..self },
+            1.0 + (self.acquisition_gain - 1.0) * boost)
     }
 
     fn slowdown(&self, distance: f64) -> f64 {
@@ -295,7 +404,9 @@ impl MotionConfig {
     }
 
     pub fn speed(&self, distance: f64, maximum: u16) -> u16 {
-        (f64::from(maximum) * self.slowdown(distance)).round().clamp(90.0, f64::from(maximum)) as u16
+        // Allow at least one integer unit per dispatch when the speed limiter has settled.
+        let minimum = (1.0 / DISPATCH_INTERVAL.as_secs_f64()).ceil();
+        (f64::from(maximum) * self.slowdown(distance)).round().clamp(minimum, f64::from(maximum)) as u16
     }
 }
 
@@ -361,6 +472,23 @@ impl Smoothing {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+
+    #[test]
+    fn low_speed_diagonal_preserves_both_directions_and_the_step_limit() {
+        let mut dispatcher = Dispatcher::new(DryRunDriver);
+        let now = Instant::now();
+        let mut command = PendingMove { movement: RelativeMove { dx: -10, dy: 4 }, sequence: 1,
+            frame_at: 0, created: now, expires_at_ms: 0, held: None, limits: Some((120, 4000)), target: None };
+        for horizontal in [-10, 10] {
+            command.movement.dx = horizontal;
+            let moves: Vec<_> = (0..30).map(|_| dispatcher.limit_live(command)).collect();
+            assert!(moves.iter().all(|movement| movement.dx * horizontal >= 0 && movement.dy >= 0 &&
+                f64::from(movement.dx).hypot(f64::from(movement.dy)) <= 2.04));
+            assert!(moves.iter().any(|movement| movement.dx != 0 && movement.dy > 0));
+        }
+        command.movement.dy = 0;
+        assert_eq!(dispatcher.limit_live(command).dy, 0);
+    }
 
     #[test]
     fn pd_brakes_on_approach_without_reversing_and_respects_dead_zone() {

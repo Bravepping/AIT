@@ -29,6 +29,9 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
     delay_preflight = threading.Event()
     drop_move_ack = threading.Event()
     drop_monitor_ack = threading.Event()
+    delay_mask_ack = threading.Event()
+    drop_mask_ack = threading.Event()
+    mask_commands = queue.Queue()
     preflights = queue.Queue()
     stopping = threading.Event()
     hold_result = {}
@@ -45,6 +48,16 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
                 if len(packet) >= 16:
                     opcode, = struct.unpack_from("<I", packet, 12)
                     commands.append(opcode)
+                    if opcode == 0x23234343:
+                        _, flags, sequence, _ = struct.unpack_from("<IIII", packet)
+                        mask_commands.put((flags, packet[:16], source))
+                        if drop_mask_ack.is_set():
+                            continue
+                        if delay_mask_ack.is_set() and flags & 0x60:
+                            delay_mask_ack.clear()
+                            wrong_sequence = struct.pack("<I", sequence + 1)
+                            fake.sendto(packet[:8] + wrong_sequence + packet[12:16], source)
+                            continue
                     if opcode == 0xaede7345:
                         moves.put(packet[16:])
                         if drop_move_ack.is_set():
@@ -152,6 +165,30 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
                          expires_at_ms=time.time_ns() // 1_000_000 + lifetime, hold_mask=3,
                          report=held["reports"], report_at_ms=held["report_at_ms"])
 
+                def auto_arm(*, idle_timeout=False):
+                    keys(0, idle=True)
+                    send("auto_enable")
+                    wait(lambda item: item.get("kind") == "auto_available")
+                    if idle_timeout:
+                        wait(lambda item: item.get("buttons") == -1 and item.get("age_ms", 0) > 1200)
+                    assert keys(1)["xy_status"] == "restored"
+                    return keys(3, idle=True)
+
+                def take_over(takeover_id, held):
+                    send("auto_takeover", id=takeover_id, report=held["reports"], report_at_ms=held["report_at_ms"])
+
+                def takeover_status(takeover_id, expected):
+                    event = wait(lambda item: item.get("kind") == "auto_takeover_status" and item["id"] == takeover_id)
+                    assert event["status"] == expected, event
+
+                def mask_packet(expected):
+                    flags, packet, destination = mask_commands.get(timeout=2)
+                    assert flags == expected, (flags, expected)
+                    return packet, destination
+
+                def axes_status(expected):
+                    return wait(lambda item: item.get("xy_status") == expected and not item.get("busy"))
+
                 try:
                     send("connect", ip="127.0.0.1", port=fake.getsockname()[1], uuid="1234ABCD")
                     wait(lambda item: item.get("connected"))
@@ -163,13 +200,20 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
                     if hold_diagnostics:
                         long_holds()
                     if auto_tracking:
+                        mask_packet(0)
                         held = keys(3, idle=True)
                         auto_intent(1, held)
-                        status(1, "cancelled")
-                        keys(0, idle=True)
-                        send("auto_enable")
-                        wait(lambda item: item.get("kind") == "auto_available")
-                        held = keys(3, idle=True)
+                        status(1, "rejected")
+                        held = auto_arm(idle_timeout=True)
+                        assert mask_commands.empty()
+                        delay_mask_ack.set()
+                        take_over(1, held)
+                        packet, destination = mask_packet(0x60)
+                        auto_intent(2, held)
+                        status(2, "rejected")
+                        assert moves.empty()
+                        fake.sendto(packet, destination)
+                        takeover_status(1, "acknowledged")
                         auto_intent(2, held)
                         payload = moves.get(timeout=2)
                         status(2, "acknowledged")
@@ -181,29 +225,59 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
                         auto_intent(3, held, lifetime=-1)
                         status(3, "rejected")
                         keys(2)
-                        held_again = keys(3, idle=True)
+                        mask_packet(0)
+                        axes_status("restored")
                         auto_intent(4, held)
-                        status(4, "cancelled")
+                        status(4, "rejected")
+
+                        held = auto_arm()
+                        delay_mask_ack.set()
+                        take_over(2, held)
+                        packet, destination = mask_packet(0x60)
+                        keys(1)
+                        fake.sendto(packet, destination)
+                        takeover_status(2, "cancelled")
+                        mask_packet(0)
+                        axes_status("restored")
+
+                        held = auto_arm()
+                        take_over(3, held)
+                        mask_packet(0x60)
+                        takeover_status(3, "acknowledged")
                         wait(lambda item: item.get("buttons") == -1 and item.get("age_ms", 0) > 1200
                              and item.get("connected") and item.get("monitoring"))
-                        auto_intent(5, held_again)
+                        mask_packet(0)
+                        axes_status("restored")
+                        auto_intent(5, held)
                         status(5, "rejected")
-                        keys(0, idle=True)
-                        held_again = keys(3, idle=True)
-                        auto_intent(6, held_again)
-                        status(6, "cancelled")
+
+                        held = auto_arm()
+                        take_over(4, held)
+                        mask_packet(0x60)
+                        takeover_status(4, "acknowledged")
+                        drop_mask_ack.set()
                         send("auto_stop")
-                        auto_intent(7, held_again)
-                        status(7, "cancelled")
-                        keys(0, idle=True)
-                        send("auto_enable")
-                        wait(lambda item: item.get("kind") == "auto_available")
-                        held = keys(3, idle=True)
+                        mask_packet(0)
+                        assert not axes_status("recovery_pending")["connected"]
+                        auto_intent(6, held)
+                        status(6, "rejected")
+                        drop_mask_ack.clear()
+                        send("connect", ip="127.0.0.1", port=fake.getsockname()[1], uuid="1234ABCD")
+                        mask_packet(0)
+                        assert axes_status("restored")["connected"]
+                        send("monitor", port=port)
+                        wait(lambda item: item.get("monitoring"))
+
+                        held = auto_arm()
+                        take_over(5, held)
+                        mask_packet(0x60)
+                        takeover_status(5, "acknowledged")
                         drop_move_ack.set()
-                        auto_intent(8, held)
+                        auto_intent(7, held)
                         assert moves.get(timeout=2) == expected
-                        status(8, "fault")
-                        wait(lambda item: item.get("kind") == "kmbox" and item["connected"] is False)
+                        status(7, "fault")
+                        mask_packet(0)
+                        wait(lambda item: item.get("kind") == "kmbox" and not item["connected"] and not item["busy"])
                     elif controller:
                         held = keys(3, idle=True)
                         command = subprocess.check_output([str(controller), "--verify-kmbox-commands",
@@ -271,6 +345,8 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
             stopping.set()
             listener.join()
     expected_commands = {0xaf3c2828, 0x27388020}
+    if auto_tracking:
+        expected_commands.add(0x23234343)
     if auto_tracking or controller:
         expected_commands.add(0xaede7345)
         assert commands.count(0xaede7345) == (2 if auto_tracking else 1)
@@ -285,6 +361,9 @@ def verify(executable, output, controller=None, auto_tracking=False, hold_diagno
         result.update({"arming_stop_and_missing_ack": auto_tracking,
                        "fresh_reports_after_stale_require_rearm": auto_tracking,
                        "terminal_status_duplicate_expiry_and_release": bool(controller) or auto_tracking})
+    if auto_tracking:
+        result.update({"movement_requires_matching_mask_ack": True, "release_before_mask_ack_restores_axes": True,
+                       "restore_ack_required_on_reconnect": True})
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
 

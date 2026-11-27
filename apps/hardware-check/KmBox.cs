@@ -27,6 +27,11 @@ namespace VisionHardwareCheck
 #if !KMBOX_READONLY
         const uint MoveCommand = 0xaede7345;
 #endif
+#if KMBOX_AUTO_TRACKING
+        const int AutoHotkey = LeftRight;
+        const uint MaskMouseCommand = 0x23234343;
+        const uint MouseAxes = (1u << 5) | (1u << 6);
+#endif
         const uint MonitorEnable = 0xaa550000;
         const int HeaderSize = 16;
         const int ReportSize = 20;
@@ -79,6 +84,10 @@ namespace VisionHardwareCheck
 #endif
 #if KMBOX_AUTO_TRACKING
         volatile bool autoAllowed;
+        volatile bool autoHold;
+        bool pendingAuto;
+        uint mouseMask;
+        volatile string axisStatus = "unavailable";
 #endif
         volatile bool closing, halted, closeRequested;
         string connection = "未连接", monitorStatus = "已关闭";
@@ -101,6 +110,7 @@ namespace VisionHardwareCheck
             internal int IgnoredReports, StationaryReports, StationaryMaxGap, StationaryDuration;
             internal DateTime LastReportAt, LinkAt;
             internal string Connection = "未连接", Monitor = "已关闭";
+            internal string AxisStatus = "unavailable";
             internal string ManualArmBlockReason
             {
                 get
@@ -145,9 +155,24 @@ namespace VisionHardwareCheck
 
         internal bool Connect(IPEndPoint target, uint id)
         {
+#if KMBOX_AUTO_TRACKING
+            if (axisStatus == "recovery_pending" && uuid != id)
+            {
+                log("请先重连原 KMBox 确认恢复 X/Y，再切换设备");
+                return false;
+            }
+#endif
             return Enqueue(delegate
             {
                 CloseLink();
+#if KMBOX_AUTO_TRACKING
+                if (axisStatus == "recovery_pending" && uuid != id)
+                {
+                    connection = "请先重连原 KMBox 确认恢复 X/Y";
+                    return;
+                }
+                if (uuid != id) mouseMask = 0;
+#endif
                 endpoint = target;
                 uuid = id;
                 sequence = 0;
@@ -156,6 +181,9 @@ namespace VisionHardwareCheck
                 command = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 command.Connect(target);
                 Exchange("连接握手", ConnectCommand, RandomValue(), null, 1500, false);
+#if KMBOX_AUTO_TRACKING
+                if (!RestoreAxes()) throw new InvalidOperationException("连接时未确认解除物理 X/Y 屏蔽");
+#endif
                 connection = "盒子已应答";
                 heartbeatDue = clock.ElapsedMilliseconds + HeartbeatMs;
                 log("KMBox 握手应答 " + target);
@@ -198,6 +226,10 @@ namespace VisionHardwareCheck
         {
             return Enqueue(delegate
             {
+#if KMBOX_AUTO_TRACKING
+                StopAuto();
+                RestoreStoppedAxes();
+#endif
                 CloseMonitor();
                 if (command != null) Exchange("停止监控", MonitorCommand, 0, null, 750, false);
                 monitorCleanupPort = 0;
@@ -262,6 +294,9 @@ namespace VisionHardwareCheck
         {
             lock (commands)
             {
+#if KMBOX_AUTO_TRACKING
+                StopAuto();
+#endif
                 halted = true;
                 stopVersion++;
                 pending = null;
@@ -321,7 +356,8 @@ namespace VisionHardwareCheck
             lock (commands)
             {
                 var current = Current;
-                if (closing || closeRequested || busy || pending != null || !current.CanMove || current.Buttons != 0)
+                if (closing || closeRequested || halted || busy || pending != null || autoAllowed ||
+                    axisStatus != "restored" || !current.CanMove || current.Buttons != 0)
                     return false;
                 autoAllowed = true;
                 return true;
@@ -333,15 +369,92 @@ namespace VisionHardwareCheck
             lock (commands)
             {
                 autoAllowed = false;
+                autoHold = false;
                 stopVersion++;
+                if (pendingAuto) pending = null;
+                pendingAuto = false;
             }
             wake.Set();
+        }
+
+        internal bool TakeOver(int number, long reportAtMs, Action<string> outcome)
+        {
+            lock (commands)
+            {
+                if (!autoAllowed || autoHold || halted || closing || closeRequested || pending != null ||
+                    axisStatus != "restored" || !Current.Connected || !Current.Monitoring) return false;
+                int version = stopVersion;
+                autoHold = true;
+                pendingAuto = true;
+                pending = delegate
+                {
+                    try
+                    {
+                        DrainReports();
+                        axisStatus = "masking";
+                        uint flags = mouseMask | MouseAxes;
+                        if (!Exchange("屏蔽物理 X/Y", MaskMouseCommand, flags, null, 200, false,
+                            () => autoAllowed && version == stopVersion && PhysicalHold(AutoHotkey, number, reportAtMs)))
+                        {
+                            axisStatus = "restored";
+                            StopAuto();
+                            outcome("cancelled");
+                            return;
+                        }
+                        mouseMask = flags;
+                        axisStatus = "masked";
+                        DrainReports();
+                        UpdateCombo();
+                        Publish();
+                        log("KMBox 已应答屏蔽物理 X/Y");
+                        outcome(autoAllowed && version == stopVersion ? "acknowledged" : "cancelled");
+                    }
+                    catch
+                    {
+                        StopAuto();
+                        outcome("fault");
+                        throw;
+                    }
+                };
+            }
+            wake.Set();
+            return true;
+        }
+
+        bool RestoreAxes()
+        {
+            axisStatus = "restoring";
+            uint flags = mouseMask & ~MouseAxes;
+            try
+            {
+                Exchange("解除物理 X/Y 屏蔽", MaskMouseCommand, flags, null, 250, false);
+                mouseMask = flags;
+                axisStatus = "restored";
+                log("KMBox 已应答解除物理 X/Y 屏蔽");
+                Publish();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                axisStatus = "recovery_pending";
+                log("物理 X/Y 恢复待确认，请重连 KMBox：" + ex.Message);
+                return false;
+            }
+        }
+
+        void RestoreStoppedAxes()
+        {
+            if (!autoAllowed && (axisStatus == "masked" || axisStatus == "masking") && !RestoreAxes())
+                throw new InvalidOperationException("物理 X/Y 恢复待确认");
         }
 #endif
 
 #if KMBOX_INTEGRATION_LOOPBACK || KMBOX_AUTO_TRACKING
         internal bool MoveHeld(int x, int y, long id, long expiresAtMs, int mask, int number, long reportAtMs, Action<string> outcome)
         {
+#if KMBOX_AUTO_TRACKING
+            if (mask != AutoHotkey || !autoAllowed || axisStatus != "masked") return false;
+#endif
             long utc = EpochMs(PreciseUtcNow());
             if (id <= 0 || mask < 1 || mask > 31 || number <= 0 || x < -24 || x > 24 || y < -24 || y > 24 ||
                 expiresAtMs <= utc || expiresAtMs - utc > 45 || reportAtMs > utc || reportAtMs <= 0 ||
@@ -349,15 +462,20 @@ namespace VisionHardwareCheck
             return QueueRelative(x, y, 24, clock.ElapsedMilliseconds + (expiresAtMs - utc), () =>
             {
 #if KMBOX_AUTO_TRACKING
-                if (!autoAllowed || EpochMs(PreciseUtcNow()) - EpochMs(linkAt) > ReportTimeoutMs) return false;
+                if (!autoAllowed || axisStatus != "masked" || EpochMs(PreciseUtcNow()) - EpochMs(linkAt) > ReportTimeoutMs) return false;
 #endif
-                if (EpochMs(PreciseUtcNow()) >= expiresAtMs || reportAtMs <= monitorEpochMs || number > reportCount ||
-                    reportAtMs > EpochMs(lastReportAt) || (number == reportCount && reportAtMs != EpochMs(lastReportAt)) ||
-                    (buttons & mask) != mask || monitor.Poll(0, SelectMode.SelectRead)) return false;
-                for (int bit = 0; bit < releasedAtReport.Length; ++bit)
-                    if ((mask & (1 << bit)) != 0 && releasedAtReport[bit] > number) return false;
-                return true;
+                return EpochMs(PreciseUtcNow()) < expiresAtMs && PhysicalHold(mask, number, reportAtMs);
             }, outcome, id);
+        }
+
+        bool PhysicalHold(int mask, int number, long reportAtMs)
+        {
+            if (monitor == null || !IsFresh() || reportAtMs <= monitorEpochMs || number <= 0 || number > reportCount ||
+                reportAtMs > EpochMs(lastReportAt) || (number == reportCount && reportAtMs != EpochMs(lastReportAt)) ||
+                (buttons & mask) != mask || monitor.Poll(0, SelectMode.SelectRead)) return false;
+            for (int bit = 0; bit < releasedAtReport.Length; ++bit)
+                if ((mask & (1 << bit)) != 0 && releasedAtReport[bit] > number) return false;
+            return true;
         }
 #endif
 
@@ -375,7 +493,19 @@ namespace VisionHardwareCheck
 #endif
                 var current = Current;
                 string unavailable = requireFreshReport ? current.MoveBlockReason : current.ManualArmBlockReason;
-                if (unavailable != null || closing || closeRequested || halted || busy || pending != null) return false;
+#if KMBOX_AUTO_TRACKING
+                if (id != 0)
+                {
+                    if (!autoAllowed || axisStatus != "masked" || !current.Connected || !current.Monitoring ||
+                        current.Buttons < 0 || current.Age > ReportTimeoutMs) return false;
+                }
+                else
+#endif
+                if (unavailable != null || busy) return false;
+                if (closing || closeRequested || halted || pending != null) return false;
+#if KMBOX_AUTO_TRACKING
+                pendingAuto = id != 0;
+#endif
                 int version = stopVersion;
                 Func<string> blocked = () => {
                     if (version != stopVersion || halted || closing || closeRequested) return "已急停或断开";
@@ -454,15 +584,24 @@ namespace VisionHardwareCheck
                         closeRequested = false;
                         next = pending;
                         pending = null;
+#if KMBOX_AUTO_TRACKING
+                        pendingAuto = false;
+#endif
                         busy = disconnect || next != null;
                     }
                     if (busy) Publish();
                     try
                     {
                         if (disconnect) CloseLink();
+#if KMBOX_AUTO_TRACKING
+                        RestoreStoppedAxes();
+#endif
                         if (next != null && !closing) next();
                         DrainReports();
                         UpdateCombo();
+#if KMBOX_AUTO_TRACKING
+                        RestoreStoppedAxes();
+#endif
                         if (command != null && clock.ElapsedMilliseconds >= heartbeatDue)
                         {
                             uint option = monitorPort == 0 ? 0 : MonitorEnable | (uint)monitorPort;
@@ -560,15 +699,15 @@ namespace VisionHardwareCheck
         void UpdateCombo()
         {
             bool fresh = IsFresh();
+            bool both = (buttons & LeftRight) == LeftRight;
 #if KMBOX_AUTO_TRACKING
-            if (!fresh && autoAllowed)
+            if (autoAllowed && autoHold && (!fresh || !both))
             {
                 StopAuto();
-                log("物理按键报文已过期，真实跟随许可已撤销，请重新武装");
+                log(fresh ? "组合键已松开，真实跟随许可已撤销" : "物理按键报文已过期，真实跟随许可已撤销，请重新武装");
             }
 #endif
             bool eligible = fresh && !halted && !closing;
-            bool both = (buttons & LeftRight) == LeftRight;
             if (!eligible) comboReady = false;
             else if (!both) comboReady = true;
             bool active = eligible && comboReady && both;
@@ -608,11 +747,11 @@ namespace VisionHardwareCheck
             Write32(packet, 8, packetId);
             Write32(packet, 12, opcode);
             if (payload != null) Buffer.BlockCopy(payload, 0, packet, HeaderSize, payload.Length);
-            if (movement)
+            if (canSend != null)
             {
                 lock (commands)
                 {
-                    if (halted || closing || canSend == null || !canSend()) return false;
+                    if (halted || closing || closeRequested || !canSend()) return false;
                     SendPacket(stage, packet);
                 }
             }
@@ -627,6 +766,9 @@ namespace VisionHardwareCheck
                     DrainReports();
                     UpdateCombo();
                     Publish();
+#if KMBOX_AUTO_TRACKING
+                    if (opcode == MonitorCommand && !autoAllowed && axisStatus == "masked") return false;
+#endif
                     if (!command.Poll(5000, SelectMode.SelectRead)) continue;
                     int size = command.Receive(reply);
                     if (size >= HeaderSize && Read32(reply, 8) == packetId && Read32(reply, 12) == opcode)
@@ -704,6 +846,12 @@ namespace VisionHardwareCheck
 
         void CloseLink()
         {
+#if KMBOX_AUTO_TRACKING
+            StopAuto();
+            if (command != null && (axisStatus == "masked" || axisStatus == "masking")) RestoreAxes();
+            if (axisStatus != "recovery_pending") axisStatus = "unavailable";
+#endif
+            connection = "未连接";
             CloseMonitor();
             if (command != null)
             {
@@ -717,7 +865,6 @@ namespace VisionHardwareCheck
             command = null;
             linkAt = default(DateTime);
             monitorCleanupPort = 0;
-            connection = "未连接";
         }
 
         void Publish()
@@ -731,6 +878,9 @@ namespace VisionHardwareCheck
                 LastReportAt = lastReportAt, LinkAt = linkAt, Connection = connection, Monitor = monitorStatus,
                 IgnoredReports = ignoredReports, StationaryReports = stationaryReports,
                 StationaryDuration = stationaryDuration, StationaryMaxGap = stationaryMaxGap
+#if KMBOX_AUTO_TRACKING
+                , AxisStatus = axisStatus == "masked" && !autoAllowed ? "restoring" : axisStatus
+#endif
             };
             if (observe != null) observe(snapshot);
         }

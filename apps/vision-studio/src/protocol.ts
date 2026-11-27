@@ -72,6 +72,7 @@ export type Candidate = {
   selection_ms: number
   movement_ms: number
   selection_reason: string
+  control_phase: 'acquisition' | 'tracking' | null
 }
 
 export type DryRun = {
@@ -100,6 +101,7 @@ export type KmBox = {
   report_at_ms?: number; longest_gap_ms?: number; ignored_reports?: number
   heartbeat_acks?: number; wire_trace_active?: boolean
   stationary_reports?: number; stationary_ms?: number; stationary_max_gap_ms?: number
+  xy_status?: 'unavailable' | 'masking' | 'masked' | 'restoring' | 'restored' | 'recovery_pending'
 }
 export type RateDip = {
   kind: 'rate_dip'; metric: 'input' | 'inference'; fps: number; threshold: number; duration_ms: number | null
@@ -114,7 +116,8 @@ export type Backend = {
 export type WorkerEvent =
   | Stream | Inference | DryRun | KmBox | Gpu | RateDip
   | { kind: 'ready'; providers?: Engine[]; preview_frames?: number }
-  | { kind: 'worker_exit' | 'kmbox_exit' }
+  | { kind: 'worker_exit' }
+  | { kind: 'kmbox_exit'; recovery_pending?: boolean }
   | { kind: 'preview_state'; fps: number; preview: number; frames: number; error?: string }
   | { kind: 'preview'; source: number; preview: number; image: string }
   | { kind: 'stream_state'; state: 'lost' | 'resumed' | 'live'; source: number; gap_ms: number }

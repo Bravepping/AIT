@@ -16,6 +16,8 @@ mod soak;
 
 pub fn verify_control_stream() -> Result<(), String> { soak::verify() }
 
+pub fn verify_physical_dry_run() -> Result<(), String> { soak::verify_physical() }
+
 pub fn verify_transport_stream(report: u64, report_at_ms: u64) -> Result<(), String> {
     mock::write_transport(report, report_at_ms)
 }

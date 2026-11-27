@@ -107,3 +107,43 @@ pub(super) fn verify() -> Result<(), String> {
 fn write_line(output: &mut impl Write, value: Value) -> Result<(), String> {
     writeln!(output, "{value}").and_then(|_| output.flush()).map_err(|error| error.to_string())
 }
+
+pub(super) fn verify_physical() -> Result<(), String> {
+    let mut gate = AutomationController::default();
+    let profile = serde_json::from_value(json!({"mask":3,"enabled_classes":[0,1,2,3,4,5,6],
+        "gain_x":10.0/13.0,"gain_y":10.0/13.0,"dead_zone_px":2.0,"smooth_half_life_ms":12.0}))
+        .map_err(|error| error.to_string())?;
+    gate.configure(vec![profile])?;
+    gate.request_stream(1);
+    gate.request_model(1);
+    let mut arm_on_mask = None;
+    let mut last_condition = Value::Null;
+    let mut last_sample = None;
+    let mut observation = Value::Null;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    for line in io::stdin().lock().lines() {
+        let event: Value = serde_json::from_str(&line.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        match event["kind"].as_str() {
+            Some("operator_arm") => arm_on_mask = event["wait_for_mask"].as_u64().filter(|mask| *mask <= 2),
+            Some("kmbox") => { gate.buttons(&event); observation = event; }
+            _ => { gate.worker(&event); }
+        }
+        if arm_on_mask.is_some_and(|mask| observation["buttons"] == mask) && observation["connected"] == true
+            && observation["monitoring"] == true && gate.arm().is_ok()
+        {
+            write_line(&mut output, json!({"event":"operator_armed","at_ms":super::now_ms(),"physical_mask":arm_on_mask}))?;
+            arm_on_mask = None;
+        }
+        gate.tick();
+        let snapshot = gate.snapshot();
+        let condition = json!([snapshot["state"],snapshot["reason"],snapshot["observation"]["button_mask"],snapshot["candidate"]["track_id"]]);
+        let sample_due = snapshot["candidate"].is_object() && last_sample.is_none_or(|at: Instant| at.elapsed() >= Duration::from_millis(250));
+        if condition != last_condition || sample_due {
+            last_condition = condition;
+            last_sample = Some(Instant::now());
+            write_line(&mut output, snapshot)?;
+        }
+    }
+    Ok(())
+}

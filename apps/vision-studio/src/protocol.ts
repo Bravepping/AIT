@@ -10,7 +10,7 @@ export type Command =
 export type MonitorCommand =
   | { cmd: 'connect'; ip: string; port: number; uuid: string }
   | { cmd: 'monitor'; port: number }
-  | { cmd: 'stop_monitor' | 'disconnect' }
+  | { cmd: 'stop_monitor' | 'disconnect' | 'trace_wire' }
   | { cmd: 'confirm_input'; pairing: string }
   | { cmd: 'stop_confirmation' }
 
@@ -83,6 +83,10 @@ export type DryRun = {
   queue_ms?: number | null
   hold_confirmed?: boolean
   event_hold_age_ms?: number | null
+  observation?: {
+    at_ms: number; button_age_ms: number | null; button_mask: number | null; button_report: number | null
+    video_age_ms: number | null; inference_age_ms: number | null
+  }
   last_stop?: {
     id: number; at_ms: number; reason: string; previous_state: DryRun['state']; mode: DryRun['mode']
     video_age_ms: number | null; inference_age_ms: number | null; age_limit_ms: number
@@ -91,8 +95,10 @@ export type DryRun = {
 }
 export type KmBox = {
   kind: 'kmbox'; connected: boolean; monitoring: boolean; buttons: number
+  busy?: boolean
   reports: number; age_ms: number; connection: string; monitor: string; halted: boolean
   report_at_ms?: number; longest_gap_ms?: number; ignored_reports?: number
+  heartbeat_acks?: number; wire_trace_active?: boolean
   stationary_reports?: number; stationary_ms?: number; stationary_max_gap_ms?: number
 }
 export type RateDip = {

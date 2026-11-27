@@ -319,6 +319,7 @@ enum MonitorCommand {
     Connect { ip: String, port: u16, uuid: String },
     Monitor { port: u16 },
     StopMonitor,
+    TraceWire,
     Disconnect,
     ConfirmInput { pairing: String },
     StopConfirmation,
@@ -329,6 +330,7 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
     let mut session = state.0.lock().map_err(|error| error.to_string())?;
     if session.acceptance_running()? { return Err("请先关闭实体鼠标验收窗口，再连接主程序的只读监控".into()); }
     if matches!(&command, MonitorCommand::ConfirmInput { .. } | MonitorCommand::StopConfirmation) {
+        if cfg!(feature = "kmbox-hold-diagnostics") { return Err("本测试包只使用 KMBox NET 原始五键报文".into()); }
         dry_run.update(AutomationController::confirmation_changed);
     } else if let MonitorCommand::Connect { uuid, .. } = &command {
         dry_run.update(|gate| {
@@ -336,7 +338,7 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
             gate.movement.driver.reset_connection();
             update
         });
-    } else {
+    } else if !matches!(&command, MonitorCommand::TraceWire) {
         dry_run.update(AutomationController::monitor_changed);
     }
     let generation = session.generation.clone();
@@ -388,9 +390,7 @@ fn send_monitor(app: AppHandle, state: State<MonitorState>, dry_run: State<DryRu
                                 "dx":event["dx"], "dy":event["dy"], "status":event["status"],
                                 "queue_ms":queue_ms, "exchange_ms":event["elapsed_ms"], "dispatch_ms":elapsed.as_secs_f64()*1000.0,
                                 "receiver_ms":control::now_ms().saturating_sub(frame_at)}));
-                            if event["status"] == "acknowledged" {
-                                gate.record_trial_ack();
-                            } else {
+                            if event["status"] != "acknowledged" {
                                 if let Some(update) = gate.live_fault("KMBox 位移未确认，请重新武装") { safety.event(update); }
                             }
                         }
@@ -468,14 +468,13 @@ fn arm_gate(state: State<DryRunState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn arm_real_tracking(app: AppHandle, state: State<DryRunState>, profile_id: u32, dry_run_passed: bool, step_passed: bool,
-    full_passed: bool) -> Result<(), String> {
-    if !dry_run_passed || !step_passed { return Err("请先完成现场 Dry Run 和单步校准".into()); }
+fn arm_real_tracking(app: AppHandle, state: State<DryRunState>, profile_id: u32, all_profiles: bool) -> Result<(), String> {
+    if cfg!(feature = "kmbox-hold-diagnostics") { return Err("KMBox 长按专项包的真实自动发送已锁定".into()); }
     if !app.get_webview_window("main").is_some_and(|window| window.is_focused().unwrap_or(false)) {
         return Err("请让主窗口保持焦点，以便使用 F8 急停".into());
     }
     let mut gate = state.gate.lock().map_err(|error| error.to_string())?;
-    state.event(gate.arm_real(profile_id, full_passed)?);
+    state.event(gate.arm_real(profile_id, all_profiles)?);
     Ok(())
 }
 
@@ -517,6 +516,13 @@ fn main() {
         Some("--verify-start") => args.next().map(PathBuf::from),
         Some("--verify-control-stream") => {
             if let Err(error) = validation::verify_control_stream() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--verify-physical-dry-run") => {
+            if let Err(error) = validation::verify_physical_dry_run() {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

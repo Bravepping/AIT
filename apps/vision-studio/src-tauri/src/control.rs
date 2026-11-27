@@ -390,7 +390,6 @@ pub struct AutomationController<D = DryRunDriver> {
     state: AutomationState,
     auto_preview_pending: bool,
     real: Option<RealTracking>,
-    trial_acknowledged: bool,
     reason: &'static str,
     active: Option<usize>,
     buttons: u8,
@@ -417,7 +416,6 @@ pub struct AutomationController<D = DryRunDriver> {
 
 struct RealTracking {
     profiles: HashSet<u32>,
-    trial: bool,
     armed_frame: u64,
     crop: [u32; 2],
 }
@@ -429,7 +427,6 @@ impl Default for AutomationController<DryRunDriver> {
 impl<D: KmBoxDriver> AutomationController<D> {
     pub(crate) fn with_driver(driver: D) -> Self {
         Self { bindings: Vec::new(), state: AutomationState::Idle, auto_preview_pending: true, real: None,
-            trial_acknowledged: false,
             reason: "等待实时状态", active: None,
             buttons: 0, report_at: None, physical_report: None, confirmation: None, confirmation_used: false,
             link_at: 0, source: 0, source_name: String::new(), device: String::new(), model: 0, stream_live: false, video_at: None,
@@ -593,9 +590,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
         Ok(self.snapshot())
     }
 
-    pub fn arm_real(&mut self, profile_id: u32, full: bool) -> Result<Value, String> {
+    pub fn arm_real(&mut self, profile_id: u32, all_profiles: bool) -> Result<Value, String> {
         if self.real.is_some() { return Err("请先停止当前的真实跟随".into()); }
-        if full && !self.trial_acknowledged { return Err("请先在本次运行中完成单目标低速验收".into()); }
         if let Some(reason) = self.blocker() { return Err(reason.into()); }
         if !recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS) || self.physical_report.is_none()
             || self.report_at.is_none_or(|at| at.elapsed() > BUTTON_TIMEOUT)
@@ -605,16 +601,13 @@ impl<D: KmBoxDriver> AutomationController<D> {
         if self.buttons != 0 { return Err("先松开鼠标按键，再武装真实跟随".into()); }
         let frame = self.frame.as_ref().ok_or("等待推理结果")?;
         let bindings: Vec<_> = self.bindings.iter().filter(|binding| !binding.profile.toggle
-            && (full || binding.profile.id == profile_id)).collect();
+            && (all_profiles || binding.profile.id == profile_id)).collect();
         if bindings.is_empty() { return Err("请选择已启用的按住式热键方案".into()); }
-        if !full {
-            let profile = &bindings[0].profile;
-            if profile.mask != 3 || profile.classes.as_ref().is_none_or(|ids| ids.len() != 1) {
-                return Err("单目标验收需要左键 + 右键组合，并选择一个类别".into());
-            }
-        }
         for binding in &bindings {
             let profile = &binding.profile;
+            if !profile.enabled_classes.iter().any(|class| profile.includes(*class)) {
+                return Err(format!("{}没有可用的识别类别", profile.name));
+            }
             let valid = profile.calibration_site.as_ref().is_some_and(|site| {
                 site.source == self.source_name && !site.source.is_empty() && site.device == self.device && !site.device.is_empty()
                     && site.crop == [frame.width, frame.height]
@@ -625,13 +618,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
             });
             if !valid { return Err(format!("{}：请校准当前 NDI 源和裁剪尺寸", profile.name)); }
         }
-        let range = if full { f64::INFINITY } else { 64.0 };
-        if !bindings.iter().any(|binding| frame.select_with_range(&binding.profile, &mut TargetLock::default(), &mut Smoothing::default(),
-            range, binding.profile.tracking_gain).is_some()) {
-            return Err("当前画面没有该方案可锁定的目标".into());
-        }
         let real = RealTracking { profiles: bindings.iter().map(|binding| binding.profile.id).collect(),
-            trial: !full, armed_frame: frame.sequence, crop: [frame.width, frame.height] };
+            armed_frame: frame.sequence, crop: [frame.width, frame.height] };
         self.movement.driver.start_live()?;
         self.auto_preview_pending = false;
         self.reset_activation();
@@ -651,15 +639,18 @@ impl<D: KmBoxDriver> AutomationController<D> {
 
     pub fn request_device(&mut self, device: &str) -> Value {
         let device = device.chars().filter(|character| character.is_ascii_hexdigit()).collect::<String>().to_ascii_uppercase();
-        if self.device != device { self.trial_acknowledged = false; }
         self.device = device;
         self.monitor_changed()
     }
 
     pub fn monitor_failed(&mut self) -> Value {
         self.link_at = 0;
+        self.stop_monitor_input("KMBox 监控已断开或停止")
+    }
+
+    fn stop_monitor_input(&mut self, reason: &'static str) -> Value {
         self.buttons = 0;
-        let update = self.stop(AutomationState::Fault, "KMBox 监控已断开或报文过期");
+        let update = self.stop(AutomationState::Fault, reason);
         self.report_at = None;
         update
     }
@@ -677,15 +668,17 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     fn event_preview(&self) -> bool {
-        self.real.is_none() && self.active.is_some_and(|i| self.bindings[i].profile.event_preview && !self.bindings[i].profile.toggle)
+        !cfg!(feature = "kmbox-hold-diagnostics") && self.real.is_none()
+            && self.active.is_some_and(|i| self.bindings[i].profile.event_preview && !self.bindings[i].profile.toggle)
     }
 
     fn has_event_preview(&self) -> bool {
-        self.bindings.iter().any(|binding| binding.profile.event_preview && !binding.profile.toggle)
+        !cfg!(feature = "kmbox-hold-diagnostics")
+            && self.bindings.iter().any(|binding| binding.profile.event_preview && !binding.profile.toggle)
     }
 
     fn allows_report_gap(&self) -> bool {
-        self.real.is_none() && (self.confirmed_hold() || (recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS)
+        !cfg!(feature = "kmbox-hold-diagnostics") && self.real.is_none() && (self.confirmed_hold() || (recent(self.link_at, LINK_CONFIRMATION_TIMEOUT_MS)
             && (self.event_preview() || (self.active.is_none() && self.has_event_preview()))))
     }
 
@@ -695,7 +688,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
     }
 
     pub fn confirm_buttons(&mut self, event: &Value) -> Option<Value> {
-        if self.real.is_some() || self.event_preview() { return None; }
+        if cfg!(feature = "kmbox-hold-diagnostics") || self.real.is_some() || self.event_preview() { return None; }
         let at = event["at_ms"].as_u64().unwrap_or_default();
         if at == 0 {
             self.confirmation = None;
@@ -741,7 +734,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
         self.link_at = self.link_at.max(event["link_at_ms"].as_u64().filter(|at| *at <= now_ms()).unwrap_or(0));
         if buttons.is_none() || age.is_none_or(|age| age > BUTTON_TIMEOUT) {
             return if self.allows_report_gap() { self.refresh_readiness() }
-                else if self.report_at.is_some() || self.armed() { Some(self.monitor_failed()) }
+                else if self.report_at.is_some() || self.armed() { Some(self.stop_monitor_input("KMBox 物理按键报文已过期")) }
                 else { self.refresh_readiness() };
         }
         let expired = self.armed() && self.report_at.is_some_and(|at| at.elapsed() > BUTTON_TIMEOUT) && !self.allows_report_gap();
@@ -753,7 +746,9 @@ impl<D: KmBoxDriver> AutomationController<D> {
             self.physical_report = Some((count, stamp));
         }
         self.report_at = Instant::now().checked_sub(age.unwrap());
-        self.buttons = buttons.unwrap() as u8;
+        let buttons = buttons.unwrap() as u8;
+        let mask_changed = buttons != self.buttons;
+        self.buttons = buttons;
         if expired {
             return Some(self.stop(AutomationState::Fault, "KMBox 物理按键报文已过期"));
         }
@@ -784,7 +779,7 @@ impl<D: KmBoxDriver> AutomationController<D> {
             .max_by_key(|(index, binding)| (binding.profile.mask.count_ones(), std::cmp::Reverse(*index)))
             .map(|(index, _)| index);
         if self.active == next {
-            return None;
+            return (cfg!(feature = "kmbox-hold-diagnostics") && mask_changed).then(|| self.snapshot());
         }
         if self.real.is_some() && self.active.is_some() {
             return Some(self.stop(AutomationState::Stopped, "热键方案已变化，请重新武装"));
@@ -850,9 +845,8 @@ impl<D: KmBoxDriver> AutomationController<D> {
         let previously_locked = self.candidate.is_some();
         let selected = self.active.and_then(|index| self.bindings.get(index));
         let resolution = selected.zip(self.frame.as_ref()).and_then(|(binding, frame)| {
-            let intent = if let Some(real) = &self.real {
-                let radius = if real.trial { 64.0 } else { f64::INFINITY };
-                frame.select_with_range(&binding.profile, &mut self.lock, &mut self.smoothing, radius, binding.profile.tracking_gain)
+            let intent = if self.real.is_some() {
+                frame.select_with_range(&binding.profile, &mut self.lock, &mut self.smoothing, f64::INFINITY, binding.profile.tracking_gain)
             } else {
                 frame.select(&binding.profile, &mut self.lock, &mut self.smoothing)
             };
@@ -862,11 +856,10 @@ impl<D: KmBoxDriver> AutomationController<D> {
             let held = selected.filter(|binding| !binding.profile.toggle).and_then(|binding| {
                 self.physical_report.map(|(report, at_ms)| HeldInput { mask: binding.profile.mask, report, at_ms })
             });
-            if let Some((real, binding)) = self.real.as_ref().zip(selected) {
-                let speed = if real.trial { binding.profile.max_speed.min(120) } else { binding.profile.max_speed };
+            if let Some((_, binding)) = self.real.as_ref().zip(selected) {
                 self.movement.offer_live(timestamp, intent.sequence, intent.relative, Instant::now(), held,
-                    binding.profile.motion.speed(intent.offset[0].hypot(intent.offset[1]), speed),
-                    if real.trial { binding.profile.acceleration.min(1000) } else { binding.profile.acceleration },
+                    binding.profile.motion.speed(intent.offset[0].hypot(intent.offset[1]), binding.profile.max_speed),
+                    binding.profile.acceleration,
                     (intent.lock_id, intent.class));
             } else if !self.event_preview() {
                 self.movement.offer(timestamp, intent.sequence, intent.relative, Instant::now(), held);
@@ -958,7 +951,9 @@ impl<D: KmBoxDriver> AutomationController<D> {
         self.refresh_readiness()
     }
 
-    fn snapshot(&self) -> Value {
+    pub(crate) fn snapshot(&self) -> Value {
+        let at = now_ms();
+        let button_age = self.report_at.map(|instant| instant.elapsed().as_millis() as u64);
         let candidate = self.current_candidate();
         let active = self.active.and_then(|index| self.bindings.get(index));
         json!({"kind":"dry_run", "state":self.state, "armed":self.armed(), "active":active.is_some(),
@@ -969,6 +964,11 @@ impl<D: KmBoxDriver> AutomationController<D> {
                "scheduled":self.movement.submitted, "expired":self.movement.expired,
                "queue_ms":self.movement.last_queue_ms,
                "last_stop":self.last_stop,
+               "observation":{"at_ms":at, "button_age_ms":button_age,
+                   "button_mask":button_age.filter(|age| *age <= BUTTON_TIMEOUT.as_millis() as u64).map(|_| self.buttons),
+                   "button_report":self.physical_report.map(|(count, _)| count),
+                   "video_age_ms":self.video_at.and_then(|time| at.checked_sub(time)),
+                   "inference_age_ms":self.frame.as_ref().and_then(|frame| at.checked_sub(frame.frame_at))},
                "hold_confirmed":self.confirmed_hold(),
                "event_hold_age_ms":self.report_at.filter(|at| self.event_preview() && at.elapsed() > BUTTON_TIMEOUT)
                    .map(|at| at.elapsed().as_millis() as u64)})
@@ -992,10 +992,6 @@ impl<D: KmBoxDriver> AutomationController<D> {
 
     pub(crate) fn live_fault(&mut self, reason: &'static str) -> Option<Value> {
         self.real.is_some().then(|| self.stop(AutomationState::Fault, reason))
-    }
-
-    pub(crate) fn record_trial_ack(&mut self) {
-        if self.real.as_ref().is_some_and(|real| real.trial) { self.trial_acknowledged = true; }
     }
 
     pub(crate) fn source_revision(&self) -> u32 { self.source }
